@@ -13,8 +13,9 @@ class CollabNetworkClient:
     def connect(self):
         """Initializes the secure WebSocket connection."""
         self.is_running = True
+        # Connect to base WebSocket (room isolation handled by server)
         self.ws = websocket.WebSocketApp(
-            f"{self.server_url}/ws/{config.ROOM_ID}",
+            self.server_url,
             on_message=self.on_message,
             on_error=self.on_error,
             on_close=self.on_close
@@ -22,6 +23,7 @@ class CollabNetworkClient:
         # Run in a background thread to prevent UI lockup
         self.thread = threading.Thread(target=self.ws.run_forever, daemon=True)
         self.thread.start()
+        print(f"[COLLAB NETWORK] WebSocket connecting to {self.server_url}")
 
     def on_message(self, ws, message):
         """Routes incoming packets into the Blender inbound queue."""

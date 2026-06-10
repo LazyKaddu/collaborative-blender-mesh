@@ -5,6 +5,8 @@ def network_sync_tick():
     # 1. Drain the outbound queue (what the user changed)
     while not config.OUTBOUND_QUEUE.empty():
         op = config.OUTBOUND_QUEUE.get()
+        # Add room context to operation
+        op["room_id"] = config.ROOM_ID
         network_client.client.send_operation(op)
         config.OUTBOUND_QUEUE.task_done()
     
@@ -16,3 +18,10 @@ def network_sync_tick():
 
 def start_sync():
     bpy.app.timers.register(network_sync_tick)
+
+def stop_sync():
+    """Stops the network sync timer."""
+    try:
+        bpy.app.timers.unregister(network_sync_tick)
+    except:
+        pass

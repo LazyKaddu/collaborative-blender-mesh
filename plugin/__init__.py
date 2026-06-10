@@ -12,50 +12,70 @@ import bpy
 import sys
 
 
-
 def register():
     """Dynamically import and activate modules at execution time."""
     
-    # ─── FORCE BLENDER TO FLUSH ITS INTERNAL MEMORY CACHE ───
-    # This destroys Python's ghost references so it re-reads your live desktop files
+    print("Registering Multiuser Collaboration Engine...")
     
-    print("regestering")
-    modules_to_flush = [
-        "multiuser_collab.config",
-        "multiuser_collab.core_handlers",
-        "multiuser_collab.thread_worker",
-        "multiuser_collab.inbound_executor",
-        "multiuser_collab.protocol_packer",
-        "multiuser_collab.operations_tracker",
-        "multiuser_collab.lock_visualization"
-    ]
-    # for mod in modules_to_flush:
-    #     if mod in sys.modules:
-    #         print("flushed module",mod)
-    #         del sys.modules[mod]
-
-    # Now we can safely import the fresh files from disk
+    # Import configuration first
     from . import config
-
-    from . import thread_worker
-    from . import inbound_executor
     from . import ui_panel
+    from . import core_handlers
+    from . import inbound_executor
+    from . import thread_worker
+    
+    # Register PropertyGroup for UI
+    bpy.utils.register_class(ui_panel.MultiuserCollabProperties)
+    
+    # Register UI Panel
+    bpy.utils.register_class(ui_panel.MULTIUSER_PT_collaboration_panel)
+    
+    # Register Operators
+    bpy.utils.register_class(ui_panel.MULTIUSER_OT_create_room)
+    bpy.utils.register_class(ui_panel.MULTIUSER_OT_join_room)
+    bpy.utils.register_class(ui_panel.MULTIUSER_OT_disconnect_session)
+    bpy.utils.register_class(ui_panel.MULTIUSER_OT_flush_update)
+    
+    # Register scene properties
+    bpy.types.Scene.multiuser_collab_props = bpy.props.PointerProperty(
+        type=ui_panel.MultiuserCollabProperties
+    )
     
     def delayed_register():
-            from . import core_handlers
-            core_handlers.register_handlers()
-            return None
-    bpy.app.timers.register(delayed_register,first_interval=0.1)
+        core_handlers.register_handlers()
+        return None
     
+    bpy.app.timers.register(delayed_register, first_interval=0.1)
+    print("Multiuser Collaboration Engine registered successfully!")
 
-    ui_panel.register()
-    # Initialize state sets
-    config.TRACKED_OBJECTS = set()
 
+def unregister():
+    """Clean up and deregister all classes and handlers."""
+    from . import ui_panel
+    from . import core_handlers
     
-   
-    # Register the safe inbound execution timer loop
-    bpy.app.timers.register(inbound_executor.execute_inbound_operations)
+    print("Unregistering Multiuser Collaboration Engine...")
+    
+    # Unregister handlers
+    core_handlers.unregister_handlers()
+    
+    # Unregister operators
+    bpy.utils.unregister_class(ui_panel.MULTIUSER_OT_flush_update)
+    bpy.utils.unregister_class(ui_panel.MULTIUSER_OT_disconnect_session)
+    bpy.utils.unregister_class(ui_panel.MULTIUSER_OT_join_room)
+    bpy.utils.unregister_class(ui_panel.MULTIUSER_OT_create_room)
+    
+    # Unregister UI Panel
+    bpy.utils.unregister_class(ui_panel.MULTIUSER_PT_collaboration_panel)
+    
+    # Unregister PropertyGroup
+    bpy.utils.unregister_class(ui_panel.MultiuserCollabProperties)
+    
+    # Remove scene property
+    if hasattr(bpy.types.Scene, "multiuser_collab_props"):
+        del bpy.types.Scene.multiuser_collab_props
+    
+    print("Multiuser Collaboration Engine unregistered successfully!")
 
     
     # Kick off the background worker threads
