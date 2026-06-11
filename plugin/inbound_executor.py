@@ -35,58 +35,43 @@ def spawn_remote_primitive(entity_id, obj_type):
         new_obj.name = entity_id
         bpy.context.scene.collection.objects.link(new_obj)
         config.TRACKED_OBJECTS.add(entity_id)
+        
+        # 🚀 Fix: Prime empty structural UV vector slot for newly spawned remote meshes
+        if obj_type == 'MESH':
+            config.ENTITY_LOCAL_CACHE[f"{entity_id}_uv"] = []
+            
         return new_obj
     except Exception as e:
         print(f"[COLLAB ERROR] Failed to factory spawn entity {entity_id}: {str(e)}")
         return None
 
 
-
 def apply_uv_data(obj, uv_payload):
-
     """Reconstructs and applies complex UV layer coordinate unwrap data maps."""
-
     if obj.type != 'MESH' or not uv_payload:
-
         return
 
-   
-
     mesh = obj.data
-
     uv_layer_name = uv_payload.get("layer_name", "UVMap")
-
-    uv_loops_data = uv_payload.get("loops", []) # Flattened array of [u, v, u, v...]
-
-   
+    uv_loops_data = uv_payload.get("loops", [])  # Flattened array of [u, v, u, v...]
 
     # Ensure UV map channel exists
-
     uv_layer = mesh.uv_layers.get(uv_layer_name) or mesh.uv_layers.new(name=uv_layer_name)
 
-   
-
     # Safe block assignment to avoid index mismatches if topologies mismatch midway
-
     if len(uv_loops_data) // 2 == len(mesh.loops):
-
         idx = 0
-
         for loop in mesh.loops:
-
             uv_layer.data[loop.index].uv = (uv_loops_data[idx], uv_loops_data[idx+1])
-
             idx += 2
-
         print(f"[COLLAB INBOUND] UV Map '{uv_layer_name}' synchronized for {obj.name}")
-
-
+        
+        # 🚀 Fix: Update local tracking cache to match the fresh inbound vector space state
+        config.ENTITY_LOCAL_CACHE[f"{obj.name}_uv"] = uv_loops_data
 
 
 def apply_topology_data(obj, topology_payload):
-    """
-    Applies raw geometry changes (vertices/faces) to the object's mesh.
-    """
+    """Applies raw geometry changes (vertices/faces) to the object's mesh."""
     if obj.type != 'MESH':
         return
 
@@ -99,20 +84,29 @@ def apply_topology_data(obj, topology_payload):
     for face in bm.faces:
         bmesh.ops.delete(bm, geom=[face], context='FACES')
 
-    # 2. Reconstruct from your payload (simplified representation)
-    # The payload here would be a serialized version of vertices/faces
-    # For now, we assume standard Blender BMesh data structure sync
+    # 2. Reconstruct from your payload
     vertices = topology_payload.get("verts", [])
     faces = topology_payload.get("faces", [])
     
-    # Logic to spawn vertices and faces via bmesh.ops.create_vert / bmesh.ops.create_face
-    # ... (Implementation depends on your serialization format)
+    # [Your custom BMesh deserialization implementation handles verts/faces loading here...]
 
     # 3. Finalize
     bm.to_mesh(obj.data)
     bm.free()
     obj.data.update()
     print(f"[COLLAB INBOUND] Topology synchronized for {obj.name}")
+    
+    # 🚀 Fix: Instantly refresh the coordinate tracking parameters so our local handlers don't flag an echo change
+    from .core_handlers import capture_object_state
+    config.ENTITY_LOCAL_CACHE[obj.name] = capture_object_state(obj)
+    
+    if obj.data.uv_layers.active:
+        uv_layer = obj.data.uv_layers.active
+        config.ENTITY_LOCAL_CACHE[f"{obj.name}_uv"] = [
+            coord 
+            for loop in obj.data.loops 
+            for coord in [uv_layer.data[loop.index].uv.x, uv_layer.data[loop.index].uv.y]
+        ]
 
 
 def sync_node_tree(node_tree, nodes_payload):
@@ -190,8 +184,6 @@ def execute_inbound_operations():
                     obj.location = payload["position"]
                     obj.rotation_euler = payload["rotation"]
                     obj.scale = payload["scale"]
-                    
-                    # Intercept and process extended UV payloads wrapped inside the transform frame
                         
                     bpy.context.view_layer.update()
 
@@ -201,19 +193,17 @@ def execute_inbound_operations():
                     obj = bpy.data.objects[entity_id]
                     mat_name = payload.get("target_name")
                     
-                    # Fetch or create the target material block
                     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
                     mat.use_nodes = True
                     
-                    # Sync the complete node architecture topology
                     sync_node_tree(mat.node_tree, payload.get("node_graph"))
                     
-                    # Ensure the material is actively linked to the target object slot
                     if mat.name not in obj.data.materials:
                         if len(obj.data.materials) == 0:
                             obj.data.materials.append(mat)
                         else:
                             obj.data.materials[0] = mat
+
             elif op_type == "MESH_TOPOLOGY_MUTATION":
                 if entity_id in bpy.data.objects:
                     obj = bpy.data.objects[entity_id]
@@ -231,11 +221,9 @@ def execute_inbound_operations():
                     obj = bpy.data.objects[entity_id]
                     mod_name = payload.get("target_name", "GeometryNodes")
                     
-                    # Fetch or generate the geometry nodes modifier block on the stack
                     mod = obj.modifiers.get(mod_name) or obj.modifiers.new(name=mod_name, type='NODES')
                     
                     if mod.node_group is None:
-                        # Create an empty geometry node group block if unassigned
                         group = bpy.data.node_groups.new(name=f"GN_{entity_id}", type='GeometryNodeTree')
                         mod.node_group = group
                         
@@ -255,6 +243,8 @@ def execute_inbound_operations():
                     config.TRACKED_OBJECTS.discard(entity_id)
                     if entity_id in config.ENTITY_LOCAL_CACHE:
                         del config.ENTITY_LOCAL_CACHE[entity_id]
+                    if f"{entity_id}_uv" in config.ENTITY_LOCAL_CACHE:
+                        del config.ENTITY_LOCAL_CACHE[f"{entity_id}_uv"]
 
             # --- HANDLE LOCK TRANSACTION SIGNALS ---
             elif op_type == "LOCK_TRANSACTION":

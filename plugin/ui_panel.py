@@ -9,6 +9,7 @@ from . import scene_manager
 from . import config
 from . import network_client
 from . import sync_loop
+from .core_handlers import register_handlers  # 🚀 Added handler hook
 
 # Initialize our API client instance globally within the module
 api = CollabAPIClient()
@@ -116,9 +117,23 @@ class MULTIUSER_OT_create_room(bpy.types.Operator):
                     props.room_id = self._room_id_cache
                     props.is_connected = True
                     self.report({'INFO'}, f"Room spawned and live on Supabase: {props.room_id}")
-                    # Initialize WebSocket connection and start sync loop
+                    
+                    # 1. Seed historical baseline vectors right now 🚀
+                    scene_manager.prime_local_collaboration_cache()
+                    
+                    # 2. Connect client engine to websocket cluster
                     network_client.client.server_url = "ws://localhost:8765"
                     network_client.client.connect()
+                    
+                    # 3. Transmit structural identity payload map
+                    network_client.client.send_operation({
+                        "type": "join",
+                        "room_id": props.room_id,
+                        "client_id": config.CLIENT_ID
+                    })
+                    
+                    # 4. Turn on viewport capture loops
+                    register_handlers()
                     sync_loop.start_sync()
                     self.report({'INFO'}, "WebSocket connected and sync loop started.")
                 else:
@@ -187,11 +202,25 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
                     try: os.remove(temp_path)
                     except: pass
                     
+                    # 1. Seed historical baseline vectors right after scene finishes importing! 🚀
+                    scene_manager.prime_local_collaboration_cache()
+                    
                     props.is_connected = True
                     self.report({'INFO'}, f"Synchronized with Room: {props.room_id}")
-                    # Join WebSocket and start receiving remote operations
+                    
+                    # 2. Match socket destination URL
                     network_client.client.server_url = "ws://localhost:8765"
                     network_client.client.connect()
+                    
+                    # 3. Transmit structural identity payload map
+                    network_client.client.send_operation({
+                        "type": "join",
+                        "room_id": props.room_id,
+                        "client_id": config.CLIENT_ID
+                    })
+                    
+                    # 4. Turn on viewport capture loops
+                    register_handlers()
                     sync_loop.start_sync()
                     self.report({'INFO'}, "WebSocket connected and sync loop started.")
                 else:
@@ -284,7 +313,6 @@ class MULTIUSER_OT_flush_update(bpy.types.Operator):
         filepath, filename = scene_manager.export_draco_snapshot()
         
         # Step 1: Request a fresh upload URL specifically for an existing room update
-        # We pass the current room_id so the server knows which room context to update
         try:
             import requests
             url = f"{props.server_url}/api/room/flush"

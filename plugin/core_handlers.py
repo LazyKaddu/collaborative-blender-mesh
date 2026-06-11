@@ -21,20 +21,24 @@ def generate_lifecycle_op(action, entity_id, object_type="MESH"):
         }
     }
 
-def generate_transform_op(obj):
-    pos = obj.location
-    rot = obj.rotation_euler
-    scale = obj.scale
+def generate_transform_op(obj, initial_state, end_state):
     return {
-        "type": "ENTITY_TRANSFORM",
+        "type": "ENTITY_TRANSFORM_TRANSACTION",
         "op_id": int(time.time_ns()),
         "client_id": config.CLIENT_ID,
         "payload": {
             "entity_id": obj.name,
             "object_type": obj.type,
-            "position": [round(pos.x, 4), round(pos.y, 4), round(pos.z, 4)],
-            "rotation": [round(rot.x, 4), round(rot.y, 4), round(rot.z, 4)],
-            "scale":    [round(scale.x, 4), round(scale.y, 4), round(scale.z, 4)]
+            "initial": {
+                "position": initial_state["position"],
+                "rotation": initial_state["rotation"],
+                "scale":    initial_state["scale"]
+            },
+            "end": {
+                "position": end_state["position"],
+                "rotation": end_state["rotation"],
+                "scale":    end_state["scale"]
+            }
         }
     }
 
@@ -52,17 +56,12 @@ def generate_node_mutation_op(entity_id, target_type, target_name, action, detai
         }
     }
 
-def generate_uv_topology_op(obj):
-    """Extracts current UV map data and serializes it for network transmission."""
+def generate_uv_topology_op(obj, initial_uv_data, end_uv_data):
+    """Extracts and pairs the initial vs. final UV map data structures."""
     if obj.type != 'MESH' or not obj.data.uv_layers.active:
         return None
 
     uv_layer = obj.data.uv_layers.active
-    # Flatten UV data: [u0, v0, u1, v1, ...]
-    uv_data = []
-    for loop in obj.data.loops:
-        uv = uv_layer.data[loop.index].uv
-        uv_data.extend([uv.x, uv.y])
 
     return {
         "type": "MESH_TOPOLOGY_MUTATION",
@@ -70,9 +69,14 @@ def generate_uv_topology_op(obj):
         "client_id": config.CLIENT_ID,
         "payload": {
             "entity_id": obj.name,
-            "mutation_type": "UV_MAP_EDITED",
+            "mutation_type": "UV_MAP_TRANSACTION",
             "layer_name": uv_layer.name,
-            "loops": uv_data
+            "initial": {
+                "loops": initial_uv_data  
+            },
+            "end": {
+                "loops": end_uv_data      
+            }
         }
     }
 
@@ -80,20 +84,30 @@ def generate_uv_topology_op(obj):
 # CORE HIGH-PERFORMANCE DEPSGRAPH DISPATCHER
 # ====================================================================
 
-def main_scene_dependency_evaluator(scene, depsgraph):
+def capture_object_state(obj):
+    """Capture complete spatial state of an object with absolute precision rounding."""
+    if obj.type not in COLLAB_OBJECT_TYPES:
+        return None
+    pos = [round(obj.location.x, 4), round(obj.location.y, 4), round(obj.location.z, 4)]
+    rot = [round(obj.rotation_euler.x, 4), round(obj.rotation_euler.y, 4), round(obj.rotation_euler.z, 4)]
+    scl = [round(obj.scale.x, 4), round(obj.scale.y, 4), round(obj.scale.z, 4)]
+    return {"position": pos, "rotation": rot, "scale": scl}
+
+
+def action_completed_handler(scene):
+    """
+    Fires when user completes an action (committed via undo/redo step).
+    Detects structural and property mutations natively in a single pass.
+    """
     try:
-        # 1. THE ROOM GUARD: Only run tracking if we are in an active session
         if config.IS_PROCESSING_REMOTE_OP:
             return
         
         props = getattr(scene, "multiuser_collab_props", None)
-
         if not props or not props.is_connected:
             return
 
-        from . import operations_tracker
-        
-        current_time = time.time()
+        # 1. Unified Structural Auditing Passes
         current_objects = set(obj.name for obj in scene.objects if obj.type in COLLAB_OBJECT_TYPES)
         
         # Handle Structural Additions
@@ -102,93 +116,97 @@ def main_scene_dependency_evaluator(scene, depsgraph):
             if entity_id in scene.objects:
                 obj = scene.objects[entity_id]
                 op = generate_lifecycle_op("CREATE_PRIMITIVE", entity_id, object_type=obj.type)
-                print(f"[COLLAB OUTBOUND] Queueing CREATE: {entity_id} ({obj.type})")
+                print(f"[COLLAB OUTBOUND] CREATE: {entity_id} ({obj.type})")
                 config.OUTBOUND_QUEUE.put(op)
                 
-        # Handle Structural Deletions
+        # Handle Structural Deletions (With Safe pop checking)
         deleted_entities = config.TRACKED_OBJECTS - current_objects
         for entity_id in deleted_entities:
             op = generate_lifecycle_op("DELETE", entity_id)
-            print(f"[COLLAB OUTBOUND] Queueing DELETE: {entity_id}")
+            print(f"[COLLAB OUTBOUND] DELETE: {entity_id}")
             config.OUTBOUND_QUEUE.put(op)
-            if entity_id in config.ENTITY_LOCAL_CACHE:
-                del config.ENTITY_LOCAL_CACHE[entity_id]
+            
+            # Safe clean pop mutations
+            config.ENTITY_LOCAL_CACHE.pop(entity_id, None)
+            config.ENTITY_LOCAL_CACHE.pop(f"{entity_id}_uv", None)
 
         config.TRACKED_OBJECTS = current_objects
 
-        # Throttle structural coordinate updates safely
-        throttle_interval = getattr(config, "THROTTLE_INTERVAL", 0.05)
-        last_frame = getattr(config, "LAST_FRAME_TIME", 0.0)
-        is_throttled = (current_time - last_frame) < throttle_interval
+        # ====================================================================
+        # PROPERTY MUTATION TRANSACTION CHECKS
+        # ====================================================================
+        for obj in scene.objects:
+            if obj.type not in COLLAB_OBJECT_TYPES:
+                continue
 
-        # 2. O(M) Data-Block Iteration
-        for update in depsgraph.updates:
-            id_block = update.id
-            print("update in despgraph ",id_block)
-            
-            # --- PATH A: TRANSFORM & UV MUTATIONS ---
-            if isinstance(id_block, bpy.types.Object) and id_block.type in COLLAB_OBJECT_TYPES:
+            # --- BRANCH A: Transform Space Changes ---
+            current_state = capture_object_state(obj)
+            if current_state is not None:
+                cached_state = config.ENTITY_LOCAL_CACHE.get(obj.name)
                 
-                if (update.is_updated_transform or update.is_updated_geometry) and not is_throttled:
-                    pos = [round(id_block.location.x, 4), round(id_block.location.y, 4), round(id_block.location.z, 4)]
-                    rot = [round(id_block.rotation_euler.x, 4), round(id_block.rotation_euler.y, 4), round(id_block.rotation_euler.z, 4)]
-                    scl = [round(id_block.scale.x, 4), round(id_block.scale.y, 4), round(id_block.scale.z, 4)]
+                # Check if cache is completely empty OR if property vectors drifted
+                if not cached_state or cached_state["position"] != current_state["position"] or cached_state["rotation"] != current_state["rotation"] or cached_state["scale"] != current_state["scale"]:
                     
-                    current_spatial_state = (tuple(pos), tuple(rot), tuple(scl))
-                    
-                    if config.ENTITY_LOCAL_CACHE.get(id_block.name) != current_spatial_state:
-                        config.ENTITY_LOCAL_CACHE[id_block.name] = current_spatial_state
-                        op = generate_transform_op(id_block)
-                        
-                        print(f"[COLLAB OUTBOUND] Transform update: {id_block.name} -> pos: {pos}")
-                        
-                        # Safely attempt to record local operation
-                        if hasattr(operations_tracker, 'local_pipeline_tracker'):
-                            operations_tracker.local_pipeline_tracker.record_local_operation(op)
-                        config.OUTBOUND_QUEUE.put(op)
-            
-                elif id_block.type == 'MESH' and update.is_updated_geometry and not id_block.mode == 'EDIT':
-                    op = generate_uv_topology_op(id_block)
+                    initial_state = cached_state if cached_state else current_state
+                    op = generate_transform_op(obj, initial_state, current_state)
+                    print(f"[COLLAB OUTBOUND] Transform Transaction completed: {obj.name}")
                     config.OUTBOUND_QUEUE.put(op)
+                    
+                    config.ENTITY_LOCAL_CACHE[obj.name] = current_state
 
-            # --- PATH B: SHADER NODE GRAPH MUTATIONS ---
-            elif isinstance(id_block, bpy.types.Material):
-                material = id_block
-                if material.use_nodes and material.node_tree:
-                    for obj in bpy.data.objects:
-                        if material.name in obj.data.materials:
-                            op = generate_node_mutation_op(
-                                entity_id=obj.name,
-                                target_type="SHADER_MATERIAL",
-                                target_name=material.name,
-                                action="VALUE_CHANGED",
-                                details={"info": "Material node tree update detected"}
-                            )
-                            config.OUTBOUND_QUEUE.put(op)
-                            break
-
-            # --- PATH C: GEOMETRY NODE GRAPH MUTATIONS ---
-            elif isinstance(id_block, bpy.types.NodeTree):
-                nodetree = id_block
-                if nodetree.type == 'GEOMETRY':
-                    for obj in bpy.data.objects:
-                        for mod in obj.modifiers:
-                            if mod.type == 'NODES' and mod.node_group == nodetree:
-                                op = generate_node_mutation_op(
-                                    entity_id=obj.name,
-                                    target_type="GEOMETRY_NODES",
-                                    target_name=mod.name,
-                                    action="VALUE_CHANGED",
-                                    details={"node_graph_id": nodetree.name}
-                                )
-                                config.OUTBOUND_QUEUE.put(op)
-                                break
-                                
-        if not is_throttled:
-            config.LAST_FRAME_TIME = current_time
+            # --- BRANCH B: UV Topology Space Changes ---
+            if obj.type == 'MESH' and obj.data.uv_layers.active:
+                uv_layer = obj.data.uv_layers.active
+                
+                current_uv_snapshot = [
+                    round(coord, 4)
+                    for loop in obj.data.loops 
+                    for coord in [uv_layer.data[loop.index].uv.x, uv_layer.data[loop.index].uv.y]
+                ]
+                
+                # 🚀 Fix: Fixed broken string nested token interpolation syntax bug here
+                uv_cache_key = f"{obj.name}_uv"
+                cached_uv_snapshot = config.ENTITY_LOCAL_CACHE.get(uv_cache_key)
+                
+                if cached_uv_snapshot != current_uv_snapshot:
+                    initial_uv = cached_uv_snapshot if cached_uv_snapshot else current_uv_snapshot
+                    op = generate_uv_topology_op(obj, initial_uv, current_uv_snapshot)
+                    print(f"[COLLAB OUTBOUND] UV Topology Transaction completed: {obj.name}")
+                    config.OUTBOUND_QUEUE.put(op)
+                    
+                    config.ENTITY_LOCAL_CACHE[uv_cache_key] = current_uv_snapshot
 
     except Exception as e:
-        # MAGIC SHIELD: Prevents Blender from silently killing the handler
+        print(f"\n[COLLAB FATAL ERROR] Action Handler Crashed: {e}")
+        traceback.print_exc()
+        
+
+def main_scene_dependency_evaluator(scene, depsgraph):
+    """
+    Lightweight runtime backup evaluator. Handles direct programmatic insertions 
+    or pipeline overrides that completely step around native operator undo events.
+    """
+    try:
+        if config.IS_PROCESSING_REMOTE_OP:
+            return
+        
+        props = getattr(scene, "multiuser_collab_props", None)
+        if not props or not props.is_connected:
+            return
+
+        current_objects = set(obj.name for obj in scene.objects if obj.type in COLLAB_OBJECT_TYPES)
+        added_entities = current_objects - config.TRACKED_OBJECTS
+        
+        for entity_id in added_entities:
+            if entity_id in scene.objects:
+                obj = scene.objects[entity_id]
+                op = generate_lifecycle_op("CREATE_PRIMITIVE", entity_id, object_type=obj.type)
+                print(f"[COLLAB OUTBOUND] DEPSGRAPH PROCEDURAL CREATE: {entity_id}")
+                config.OUTBOUND_QUEUE.put(op)
+                
+        config.TRACKED_OBJECTS.update(current_objects)
+
+    except Exception as e:
         print(f"\n[COLLAB FATAL ERROR] Depsgraph Handler Crashed: {e}")
         traceback.print_exc()
 
@@ -196,12 +214,24 @@ def main_scene_dependency_evaluator(scene, depsgraph):
 # SELF-HEALING REGISTRATION HOOKS
 # ====================================================================
 def register_handlers():
-    print("regestring handler core handeler")
-    if main_scene_dependency_evaluator in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(main_scene_dependency_evaluator)
+    print("[COLLAB] Registering event handlers...")
+    
+    # Safely detach previous handle references
+    unregister_handlers()
+    
+    # Append fresh system listeners
     bpy.app.handlers.depsgraph_update_post.append(main_scene_dependency_evaluator)
-    print("added the handeler")
+    bpy.app.handlers.undo_post.append(action_completed_handler)
+    bpy.app.handlers.redo_post.append(action_completed_handler)
+    
+    print("[COLLAB] Handlers registered safely:")
+    print("  - depsgraph_update_post (Procedural catch)")
+    print("  - undo_post / redo_post (Committed local transactions)")
 
 def unregister_handlers():
     if main_scene_dependency_evaluator in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(main_scene_dependency_evaluator)
+    if action_completed_handler in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(action_completed_handler)
+    if action_completed_handler in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(action_completed_handler)
