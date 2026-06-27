@@ -1,11 +1,15 @@
 import requests
 import uuid
+from . import config
 
 class CollabAPIClient:
     def __init__(self, base_url="http://localhost:8080"):
         self.base_url = base_url
         # Generate a unique client ID for this Blender instance session
         self.client_id = str(uuid.uuid4())
+
+        config.CLIENT_ID = self.client_id
+
 
     def create_room(self, filename):
         """Asks Express for an upload ticket (Pre-signed URL)."""
@@ -36,7 +40,7 @@ class CollabAPIClient:
         """Pipes the binary GLB straight to Supabase via the pre-signed URL."""
         try:
             with open(filepath, 'rb') as f:
-                headers = {"Content-Type": "model/gltf-binary"}
+                headers = {"Content-Type": "application/octet-stream"}
                 response = requests.put(upload_url, data=f, headers=headers, timeout=60)
                 return response.status_code == 200
         except Exception as e:
@@ -56,3 +60,12 @@ class CollabAPIClient:
         except Exception as e:
             print(f"[COLLAB API ERROR] Download failed: {e}")
             return False
+    def get_room_history(room_id):
+        response = requests.get(
+            f"{self.base_url}/api/operation/history/{room_id}"
+        )
+
+        if response.status_code != 200:
+            return []
+
+        return response.json()["operations"]

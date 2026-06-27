@@ -21,13 +21,18 @@ class CollabNetworkClient:
             on_close=self.on_close
         )
         # Run in a background thread to prevent UI lockup
-        self.thread = threading.Thread(target=self.ws.run_forever, daemon=True)
+        self.thread = threading.Thread(
+            target=self.ws.run_forever, 
+            kwargs={"ping_interval": 5, "ping_timeout": 2}, 
+            daemon=True
+        )
         self.thread.start()
         print(f"[COLLAB NETWORK] WebSocket connecting to {self.server_url}")
 
     def on_message(self, ws, message):
         """Routes incoming packets into the Blender inbound queue."""
         data = json.loads(message)
+        print("data recieved from websocket ",data)
         config.INBOUND_QUEUE.put(data)
 
     def send_operation(self, op):

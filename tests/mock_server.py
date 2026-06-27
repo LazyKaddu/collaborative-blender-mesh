@@ -73,42 +73,52 @@ connected_clients = {}  # Map of room_id -> set of websockets
 
 async def ws_handler(websocket):
     room_id = None
-    
     try:
         async for message in websocket:
-            data = json.loads(message)
-            
-            # Extract room from message payload (client sends it)
-            room_id = data.get("room_id") or room_id
-            
-            if not room_id:
-                print(f"⚠️ [WS SERVER] Message without room_id: {data}")
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                print("❌ [WS SERVER] Received invalid JSON payload")
                 continue
             
-            # Register this client in the room
+            # Dynamic Room Assignment
+            msg_room = data.get("room_id")
+            if msg_room:
+                room_id = msg_room
+                
+            if not room_id:
+                print(f"⚠️ [WS SERVER] Dropping untargeted message: {data}")
+                continue
+                
+            # Ensure room pool initialization
             if room_id not in connected_clients:
                 connected_clients[room_id] = set()
-            
+                
+            # Register client immediately if missing
             if websocket not in connected_clients[room_id]:
                 connected_clients[room_id].add(websocket)
-                print(f"\n⚡ [WS SERVER] Client connected to room '{room_id}'. Room clients: {len(connected_clients[room_id])}")
+                print(f"⚡ [WS SERVER] Client registered to room '{room_id}'. Total peers: {len(connected_clients[room_id])}")
             
-            print(f"📥 [WS SERVER] Room '{room_id}' - Received Data: {data}")
+            # Print incoming mutations
+            print(f"📥 [WS SERVER] Room '{room_id}' - Dispatching Op Type: {data.get('type', 'UNKNOWN')}")
             
-            # Broadcast to OTHER clients in same room only
+            # Broadcast cleanly
+            payload_string = json.dumps(data)
             broadcast_tasks = [
-                client.send(json.dumps(data)) 
-                for client in connected_clients[room_id] if client != websocket
+                client.send(payload_string) 
+                for client in connected_clients[room_id] 
+                if client != websocket
             ]
+            
             if broadcast_tasks:
                 await asyncio.gather(*broadcast_tasks)
                 
     except websockets.exceptions.ConnectionClosed:
-        pass
+        print(f"🔌 [WS SERVER] Connection dropped unexpectedly.")
     finally:
         if room_id and room_id in connected_clients:
             connected_clients[room_id].discard(websocket)
-            print(f"❌ [WS SERVER] Client disconnected from room '{room_id}'. Remaining: {len(connected_clients[room_id])}")
+            print(f"❌ [WS SERVER] Connection cleaned. Remaining in room '{room_id}': {len(connected_clients[room_id])}")
 
 def start_http_server():
     httpd = HTTPServer(("localhost", 8080), MockHTTPHandler)

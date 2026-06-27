@@ -2,236 +2,301 @@ import bpy
 import time
 import traceback
 from . import config
+from .lock_visualization import (
+    apply_remote_lock,
+    lift_remote_lock,
+)
 
 COLLAB_OBJECT_TYPES = {'MESH', 'CURVE', 'SURFACE', 'META', 'FONT', 'LIGHT', 'CAMERA'}
 
 # ====================================================================
-# ATOMIC NODE & STRUCTURAL OPERATION GENERATORS
+# 1. ATOMIC NETWORK TRANSACTION PACKAGERS
 # ====================================================================
 
-def generate_lifecycle_op(action, entity_id, object_type="MESH"):
-    return {
-        "type": "ENTITY_LIFECYCLE",
-        "op_id": int(time.time_ns()),
-        "client_id": config.CLIENT_ID,
-        "payload": {
-            "action": action,
-            "entity_id": entity_id,
-            "object_type": object_type 
-        }
-    }
-
-def generate_transform_op(obj, initial_state, end_state):
-    return {
-        "type": "ENTITY_TRANSFORM_TRANSACTION",
-        "op_id": int(time.time_ns()),
-        "client_id": config.CLIENT_ID,
-        "payload": {
-            "entity_id": obj.name,
-            "object_type": obj.type,
-            "initial": {
-                "position": initial_state["position"],
-                "rotation": initial_state["rotation"],
-                "scale":    initial_state["scale"]
-            },
-            "end": {
-                "position": end_state["position"],
-                "rotation": end_state["rotation"],
-                "scale":    end_state["scale"]
-            }
-        }
-    }
-
-def generate_node_mutation_op(entity_id, target_type, target_name, action, details):
-    return {
-        "type": "NODE_GRAPH_MUTATION",
-        "op_id": int(time.time_ns()),
-        "client_id": config.CLIENT_ID,
-        "payload": {
-            "entity_id": entity_id,
-            "target_type": target_type,        
-            "target_name": target_name,        
-            "action": action,                  
-            "details": details                 
-        }
-    }
-
-def generate_uv_topology_op(obj, initial_uv_data, end_uv_data):
-    """Extracts and pairs the initial vs. final UV map data structures."""
-    if obj.type != 'MESH' or not obj.data.uv_layers.active:
-        return None
-
-    uv_layer = obj.data.uv_layers.active
-
-    return {
-        "type": "MESH_TOPOLOGY_MUTATION",
-        "op_id": int(time.time_ns()),
-        "client_id": config.CLIENT_ID,
-        "payload": {
-            "entity_id": obj.name,
-            "mutation_type": "UV_MAP_TRANSACTION",
-            "layer_name": uv_layer.name,
-            "initial": {
-                "loops": initial_uv_data  
-            },
-            "end": {
-                "loops": end_uv_data      
-            }
-        }
-    }
-
-# ====================================================================
-# CORE HIGH-PERFORMANCE DEPSGRAPH DISPATCHER
-# ====================================================================
-
-def capture_object_state(obj):
-    """Capture complete spatial state of an object with absolute precision rounding."""
-    if obj.type not in COLLAB_OBJECT_TYPES:
-        return None
-    pos = [round(obj.location.x, 4), round(obj.location.y, 4), round(obj.location.z, 4)]
-    rot = [round(obj.rotation_euler.x, 4), round(obj.rotation_euler.y, 4), round(obj.rotation_euler.z, 4)]
-    scl = [round(obj.scale.x, 4), round(obj.scale.y, 4), round(obj.scale.z, 4)]
-    return {"position": pos, "rotation": rot, "scale": scl}
-
-
-def action_completed_handler(scene):
+def generate_operator_packet(op, context):
     """
-    Fires when user completes an action (committed via undo/redo step).
-    Detects structural and property mutations natively in a single pass.
+    Serializes a finalized local operator into an optimized network command:
+    Splits execution into an explicit Operator Type and clean Parameter structures.
     """
-    try:
-        if config.IS_PROCESSING_REMOTE_OP:
-            return
-        
-        props = getattr(scene, "multiuser_collab_props", None)
-        if not props or not props.is_connected:
-            return
+    active_obj = context.active_object
+    target_entity = active_obj.name if active_obj else None
+    object_type = active_obj.type if active_obj else "MESH"
 
-        # 1. Unified Structural Auditing Passes
-        current_objects = set(obj.name for obj in scene.objects if obj.type in COLLAB_OBJECT_TYPES)
+    op_props = {}
+    
+    # 🚀 1. FAST-PATH TRANSFORM ROUTING
+    if op.bl_idname.startswith("TRANSFORM_OT_") and active_obj:
+        op_props["transform_digest"] = {
+            "location": tuple(active_obj.location),
+            "rotation": tuple(active_obj.rotation_euler),
+            "scale":    tuple(active_obj.scale)
+        }
         
-        # Handle Structural Additions
-        added_entities = current_objects - config.TRACKED_OBJECTS
-        for entity_id in added_entities:
-            if entity_id in scene.objects:
-                obj = scene.objects[entity_id]
-                op = generate_lifecycle_op("CREATE_PRIMITIVE", entity_id, object_type=obj.type)
-                print(f"[COLLAB OUTBOUND] CREATE: {entity_id} ({obj.type})")
-                config.OUTBOUND_QUEUE.put(op)
+    # 🚀 2. DISCRETE MACRO PARAMETER DIGESTION
+    else:
+        for prop in op.rna_type.properties:
+            if prop.is_readonly:
+                continue
                 
-        # Handle Structural Deletions (With Safe pop checking)
-        deleted_entities = config.TRACKED_OBJECTS - current_objects
-        for entity_id in deleted_entities:
-            op = generate_lifecycle_op("DELETE", entity_id)
-            print(f"[COLLAB OUTBOUND] DELETE: {entity_id}")
-            config.OUTBOUND_QUEUE.put(op)
-            
-            # Safe clean pop mutations
-            config.ENTITY_LOCAL_CACHE.pop(entity_id, None)
-            config.ENTITY_LOCAL_CACHE.pop(f"{entity_id}_uv", None)
-
-        config.TRACKED_OBJECTS = current_objects
-
-        # ====================================================================
-        # PROPERTY MUTATION TRANSACTION CHECKS
-        # ====================================================================
-        for obj in scene.objects:
-            if obj.type not in COLLAB_OBJECT_TYPES:
+            try:
+                if op.is_property_set(prop.identifier):
+                    val = getattr(op, prop.identifier)
+                    
+                    # Ensure full JSON compatibility for primitive packaging
+                    if hasattr(val, "to_tuple"):
+                        val = tuple(val)
+                    elif type(val).__name__ == "bpy_prop_array":
+                        val = list(val)
+                    elif type(val).__name__ == "Vector":
+                        val = [val.x, val.y, val.z]
+                        
+                    op_props[prop.identifier] = val
+            except Exception:
                 continue
 
-            # --- BRANCH A: Transform Space Changes ---
-            current_state = capture_object_state(obj)
-            if current_state is not None:
-                cached_state = config.ENTITY_LOCAL_CACHE.get(obj.name)
-                
-                # Check if cache is completely empty OR if property vectors drifted
-                if not cached_state or cached_state["position"] != current_state["position"] or cached_state["rotation"] != current_state["rotation"] or cached_state["scale"] != current_state["scale"]:
-                    
-                    initial_state = cached_state if cached_state else current_state
-                    op = generate_transform_op(obj, initial_state, current_state)
-                    print(f"[COLLAB OUTBOUND] Transform Transaction completed: {obj.name}")
-                    config.OUTBOUND_QUEUE.put(op)
-                    
-                    config.ENTITY_LOCAL_CACHE[obj.name] = current_state
+    # Return the clean addressable Operation Type and structural parameter map
+    return {
+        "type": "COMMAND_EXECUTION",
+        "op_id": int(time.time_ns()),
+        "client_id": config.CLIENT_ID,
+        "operator": op.bl_idname,
+        "target": target_entity,
+        "object_type": object_type,
+        "properties": op_props
+    } 
 
-            # --- BRANCH B: UV Topology Space Changes ---
-            if obj.type == 'MESH' and obj.data.uv_layers.active:
-                uv_layer = obj.data.uv_layers.active
-                
-                current_uv_snapshot = [
-                    round(coord, 4)
-                    for loop in obj.data.loops 
-                    for coord in [uv_layer.data[loop.index].uv.x, uv_layer.data[loop.index].uv.y]
-                ]
-                
-                # 🚀 Fix: Fixed broken string nested token interpolation syntax bug here
-                uv_cache_key = f"{obj.name}_uv"
-                cached_uv_snapshot = config.ENTITY_LOCAL_CACHE.get(uv_cache_key)
-                
-                if cached_uv_snapshot != current_uv_snapshot:
-                    initial_uv = cached_uv_snapshot if cached_uv_snapshot else current_uv_snapshot
-                    op = generate_uv_topology_op(obj, initial_uv, current_uv_snapshot)
-                    print(f"[COLLAB OUTBOUND] UV Topology Transaction completed: {obj.name}")
-                    config.OUTBOUND_QUEUE.put(op)
-                    
-                    config.ENTITY_LOCAL_CACHE[uv_cache_key] = current_uv_snapshot
+def generate_state_resync_packet(obj):
+    """Generates an absolute spatial transformation baseline payload."""
+    return {
+        "type": "STATE_RESYNC",
+        "op_id": int(time.time_ns()),
+        "client_id": config.CLIENT_ID,
+        "target": obj.name,
+        "location": tuple(obj.location),
+        "rotation": tuple(obj.rotation_euler),
+        "scale": tuple(obj.scale)
+    }
 
-    except Exception as e:
-        print(f"\n[COLLAB FATAL ERROR] Action Handler Crashed: {e}")
-        traceback.print_exc()
+# ====================================================================
+# 2. DISCRETE COMMAND SNIFFER & UNDO CONTROLLER
+# ====================================================================
+
+LAST_OP_TIME = 0
+LAST_OP_NAME = ""
+
+def universal_macro_sniffer(*args):
+    """
+    Universally compatible fallback sniffer. Triggers instantly after any 
+    operator macro finishes executing inside the viewport.
+    """
+    global LAST_OP_TIME, LAST_OP_NAME
+    
+    if config.IS_PROCESSING_REMOTE_OP:
+        return
+
+    # Grabs the last executed operator from the active context window context
+    op = getattr(bpy.context, "active_operator", None)
+    if not op:
+        return
+
+    # Filter out layout adjustments, UI navigation, and workspace renders
+    if op.bl_idname.startswith(("WM_", "SCREEN_", "INFO_", "OUTLINER_", "VIEW3D_", "ANIM_")):
+        return
+
+    # ⏱️ 50ms Debounce Window for smooth slider adjustments
+    current_time = time.time()
+    if op.bl_idname == LAST_OP_NAME and (current_time - LAST_OP_TIME) < 0.05:
+        return
         
+    LAST_OP_TIME = current_time
+    LAST_OP_NAME = op.bl_idname
 
-def main_scene_dependency_evaluator(scene, depsgraph):
-    """
-    Lightweight runtime backup evaluator. Handles direct programmatic insertions 
-    or pipeline overrides that completely step around native operator undo events.
-    """
     try:
-        if config.IS_PROCESSING_REMOTE_OP:
-            return
-        
-        props = getattr(scene, "multiuser_collab_props", None)
-        if not props or not props.is_connected:
-            return
+        print(f"🎬 [COLLAB SNIFFER] Universally caught local action: {op.bl_idname}")
+        packet = generate_operator_packet(op, bpy.context)
+        config.OUTBOUND_QUEUE.put(packet)
+    except Exception as e:
+        print(f"❌ [COLLAB SNIFFER ERROR] Failed to parse local operator: {e}")
 
-        current_objects = set(obj.name for obj in scene.objects if obj.type in COLLAB_OBJECT_TYPES)
-        added_entities = current_objects - config.TRACKED_OBJECTS
+def unified_command_sniffer(op, context):
+    """
+    Global operator sniffer hook. Catches finalized discrete actions 
+    instantly at the C-layer and dispatches them before they hit the undo stack.
+    """
+    global LAST_OP_TIME, LAST_OP_NAME
+    
+    if config.IS_PROCESSING_REMOTE_OP:
+        return
+
+    if op.bl_idname.startswith(("WM_", "SCREEN_", "INFO_", "OUTLINER_", "VIEW3D_", "ANIM_")):
+        return
+
+    current_time = time.time()
+    if op.bl_idname == LAST_OP_NAME and (current_time - LAST_OP_TIME) < 0.05:
+        return
         
-        for entity_id in added_entities:
+    LAST_OP_TIME = current_time
+    LAST_OP_NAME = op.bl_idname
+
+    try:
+        print(f"🎬 [COLLAB SNIFFER] Local Action caught: {op.bl_idname}")
+        if (op.bl_idname not in config.RESTRICTED_COMMANDS):
+            packet = generate_operator_packet(op, context)
+            config.OUTBOUND_QUEUE.put(packet)
+    except Exception as e:
+        print(f"❌ [COLLAB SNIFFER ERROR] Failed to serialize local operator: {e}")
+
+
+@bpy.app.handlers.persistent
+def local_undo_redo_handler(scene):
+    """Triggers immediately after a local Ctrl+Z or Ctrl+Y event."""
+    if config.IS_PROCESSING_REMOTE_OP:
+        return
+        
+    active_obj = bpy.context.active_object
+    if active_obj and active_obj.name in config.LOCAL_LOCKS:
+        try:
+            print(f"⏪ [UNDO/REDO EVENT] Local history shift caught. Resyncing object: {active_obj.name}")
+            packet = generate_state_resync_packet(active_obj)
+            config.OUTBOUND_QUEUE.put(packet)
+        except Exception as e:
+            print(f"❌ [COLLAB HISTORY ERROR] Failed to broadcast state rollback: {e}")
+
+# ====================================================================
+# 3. RUNTIME DEPSGRAPH SYSTEM LOCKS & EDIT MODE SNAPSHOTS
+# ====================================================================
+
+# 🚀 Track mode changes dynamically to run our transaction commit logic
+LAST_KNOWN_MODE = "OBJECT"
+
+def tracking_and_lock_evaluator(scene, depsgraph):
+    """
+    Monitors object selection boundaries inside the frame graph to 
+    dispatch lock assertions, state clearances, and Edit Mode commits.
+    """
+    global LAST_KNOWN_MODE
+    if config.IS_PROCESSING_REMOTE_OP:
+        return
+        
+    try:
+        view_layer = bpy.context.view_layer
+        active_obj = view_layer.objects.active if view_layer else None
+        
+        # ─── 🚀 THE TRANSACT-ON-EXIT EDIT MODE GATEWAY ───
+        if active_obj and active_obj.type == 'MESH':
+            current_mode = active_obj.mode
+            
+            # Detect the sharp transition out of Edit Mode back into Object Mode
+            if LAST_KNOWN_MODE == 'EDIT' and current_mode == 'OBJECT':
+                try:
+                    mesh = active_obj.data
+                    vertex_coords = [tuple(v.co) for v in mesh.vertices]
+                    
+                    commit_packet = {
+                        "type": "BMESH_COMMIT_SYNC",
+                        "op_id": int(time.time_ns()),
+                        "client_id": config.CLIENT_ID,
+                        "target": active_obj.name,
+                        "vertices": vertex_coords
+                    }
+                    config.OUTBOUND_QUEUE.put(commit_packet)
+                    print(f"📦 [COLLAB COMMIT] Edit Mode exited. Committing raw topology vectors for {active_obj.name} ({len(vertex_coords)} vertices).")
+                except Exception as bmesh_err:
+                    print(f"❌ [COLLAB COMMIT ERROR] Failed to package mesh snapshot: {bmesh_err}")
+            
+            LAST_KNOWN_MODE = current_mode
+
+        # ─── LOCK EVALUATION LANE ───
+        current_selected = set(
+            obj.name for obj in scene.objects 
+            if obj.select_get() and obj.type in COLLAB_OBJECT_TYPES
+        )
+        
+        # 🔓 Handle Selections Released
+        deselected_entities = config.SELECTED_OBJECTS_CACHE - current_selected
+        for entity_id in deselected_entities:
             if entity_id in scene.objects:
                 obj = scene.objects[entity_id]
-                op = generate_lifecycle_op("CREATE_PRIMITIVE", entity_id, object_type=obj.type)
-                print(f"[COLLAB OUTBOUND] DEPSGRAPH PROCEDURAL CREATE: {entity_id}")
-                config.OUTBOUND_QUEUE.put(op)
+                print(f"🔓 [COLLAB LOCK] Releasing lock asset: {entity_id}")
                 
-        config.TRACKED_OBJECTS.update(current_objects)
+                sync_packet = generate_state_resync_packet(obj)
+                config.OUTBOUND_QUEUE.put(sync_packet)
+                
+                unlock_packet = {
+                    "type": "LOCK_TRANSACTION",
+                    "client_id": config.CLIENT_ID,
+                    "target": entity_id,
+                    "action": "RELEASE"
+                }
+                config.OUTBOUND_QUEUE.put(unlock_packet)
+                config.LOCAL_LOCKS.discard(entity_id)
+        
+        # 🔒 Handle New Selections
+        newly_selected = current_selected - config.SELECTED_OBJECTS_CACHE
+        for entity_id in newly_selected:
+            print(f"🔒 [COLLAB LOCK] Requesting exclusive workspace control: {entity_id}")
+            lock_packet = {
+                "type": "LOCK_TRANSACTION",
+                "client_id": config.CLIENT_ID,
+                "target": entity_id,
+                "action": "ACQUIRE_EXCLUSIVE"
+            }
+            config.OUTBOUND_QUEUE.put(lock_packet)
+            config.LOCAL_LOCKS.add(entity_id)
+            
+        config.SELECTED_OBJECTS_CACHE = current_selected
 
     except Exception as e:
-        print(f"\n[COLLAB FATAL ERROR] Depsgraph Handler Crashed: {e}")
-        traceback.print_exc()
+        print(f"❌ [COLLAB DEPSGRAPH ERROR] Lock evaluation failed: {e}")
+
+
+def flush_active_locks():
+    """Safety clear hook on addon disconnect to prevent ghost locking properties in rooms."""
+    print("[COLLAB] Tearing down engine. Flushing active transaction locks...")
+    for entity_id in list(config.SELECTED_OBJECTS_CACHE):
+        lock_packet = {
+            "type": "LOCK_TRANSACTION",
+            "client_id": config.CLIENT_ID,
+            "target": entity_id,
+            "action": "RELEASE"
+        }
+        config.OUTBOUND_QUEUE.put(lock_packet)
+        
+    config.SELECTED_OBJECTS_CACHE.clear()
+    config.LOCAL_LOCKS.clear()
 
 # ====================================================================
-# SELF-HEALING REGISTRATION HOOKS
+# 4. SUBSYSTEM INTERFACE REGISTRATION
 # ====================================================================
+
 def register_handlers():
-    print("[COLLAB] Registering event handlers...")
-    
-    # Safely detach previous handle references
+    """Hooks event routing engine into stable app handlers."""
+    print("[COLLAB] Registering event tracking infrastructure...")
     unregister_handlers()
     
-    # Append fresh system listeners
-    bpy.app.handlers.depsgraph_update_post.append(main_scene_dependency_evaluator)
-    bpy.app.handlers.undo_post.append(action_completed_handler)
-    bpy.app.handlers.redo_post.append(action_completed_handler)
-    
-    print("[COLLAB] Handlers registered safely:")
-    print("  - depsgraph_update_post (Procedural catch)")
-    print("  - undo_post / redo_post (Committed local transactions)")
+    if hasattr(bpy.app.handlers, "macro_update_post"):
+        bpy.app.handlers.macro_update_post.append(universal_macro_sniffer)
+        print("✅ [COLLAB] Stable app macro sniffer hooked successfully.")
+    else:
+        bpy.app.handlers.depsgraph_update_post.append(universal_macro_sniffer)
+
+    bpy.app.handlers.depsgraph_update_post.append(tracking_and_lock_evaluator)
+    bpy.app.handlers.undo_post.append(local_undo_redo_handler)
+    bpy.app.handlers.redo_post.append(local_undo_redo_handler)
+
 
 def unregister_handlers():
-    if main_scene_dependency_evaluator in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(main_scene_dependency_evaluator)
-    if action_completed_handler in bpy.app.handlers.undo_post:
-        bpy.app.handlers.undo_post.remove(action_completed_handler)
-    if action_completed_handler in bpy.app.handlers.redo_post:
-        bpy.app.handlers.redo_post.remove(action_completed_handler)
+    """Cleans up handles securely from structural application channels."""
+    flush_active_locks()
+    
+    if universal_macro_sniffer in getattr(bpy.app.handlers, "macro_update_post", []):
+        bpy.app.handlers.macro_update_post.remove(universal_macro_sniffer)
+    if universal_macro_sniffer in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(universal_macro_sniffer)
+        
+    if tracking_and_lock_evaluator in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(tracking_and_lock_evaluator)
+    if local_undo_redo_handler in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(local_undo_redo_handler)
+    if local_undo_redo_handler in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(local_undo_redo_handler)

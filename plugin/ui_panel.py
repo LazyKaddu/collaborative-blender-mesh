@@ -3,7 +3,6 @@ import threading
 import os
 import random
 import string
-# Import the background logic blocks we created earlier
 from .api_client import CollabAPIClient
 from . import scene_manager
 from . import config
@@ -147,7 +146,7 @@ class MULTIUSER_OT_create_room(bpy.types.Operator):
         api.base_url = props.server_url  # Bind base client to match user's UI config entry
         
         self.report({'INFO'}, "Compressing workspace with Draco...")
-        filepath, filename = scene_manager.export_draco_snapshot()
+        filepath, filename = scene_manager.export_usd_snapshot()
         
         # Request access ticket from the Express server
         ticket = api.create_room(filename)
@@ -178,6 +177,7 @@ class MULTIUSER_OT_create_room(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+
 class MULTIUSER_OT_join_room(bpy.types.Operator):
     bl_idname = "multiuser.join_room"
     bl_label = "Join Room"
@@ -191,24 +191,10 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
             if not self._thread.is_alive():
                 props = context.scene.multiuser_collab_props
                 context.window_manager.event_timer_remove(self._timer)
-                
+                print("connection: ",self._status)
                 if self._status == "SUCCESS":
-                    # Wiping scene and reading snapshot must run on the main thread for safety
-                    scene_manager.clear_entire_scene()
-                    
-                    temp_path = os.path.join(bpy.app.tempdir, "incoming_baseline.glb")
-                    scene_manager.import_draco_snapshot(temp_path)
-                    
-                    try: os.remove(temp_path)
-                    except: pass
-                    
-                    # 1. Seed historical baseline vectors right after scene finishes importing! 🚀
-                    scene_manager.prime_local_collaboration_cache()
-                    
-                    props.is_connected = True
-                    self.report({'INFO'}, f"Synchronized with Room: {props.room_id}")
-                    
-                    # 2. Match socket destination URL
+
+
                     network_client.client.server_url = "ws://localhost:8765"
                     network_client.client.connect()
                     
@@ -218,6 +204,36 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
                         "room_id": props.room_id,
                         "client_id": config.CLIENT_ID
                     })
+                    
+                    # Wiping scene and reading snapshot must run on the main thread for safety
+                    scene_manager.clear_entire_scene()
+                    
+                    temp_path = os.path.join(bpy.app.tempdir, "incoming_baseline.usd")
+                    scene_manager.import_usd_snapshot(temp_path)
+                    
+                    # 1. Seed historical baseline vectors right after scene finishes importing! 🚀
+                    scene_manager.prime_local_collaboration_cache()
+
+                    history_response = api.get_room_history(props.room_id)
+
+                    operations = history_response.get("operations", [])
+
+                    operations.sort(key=lambda op: op["seq"])
+
+                    if config.INBOUND_QUEUE:
+                        first_live_seq = config.INBOUND_QUEUE[0]["seq"]
+
+                        operations = [
+                            op for op in operations
+                            if op["seq"] < first_live_seq
+                        ]
+                    for op in reversed(operations):
+                        config.INBOUND_QUEUE.appendleft(op)
+
+                    props.is_connected = True
+                    self.report({'INFO'}, f"Synchronized with Room: {props.room_id}")
+                    
+                    # 2. Match socket destination URL
                     
                     # 4. Turn on viewport capture loops
                     register_handlers()
@@ -248,7 +264,7 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
         config.SNAPSHOT_TIMESTAMP = meta["timestamp"]
 
         def download_worker():
-            target_path = os.path.join(bpy.app.tempdir, "incoming_baseline.glb")
+            target_path = os.path.join(bpy.app.tempdir, "incoming_baseline.usd")
             if api.download_file(download_url, target_path):
                 self._status = "SUCCESS"
             else:
