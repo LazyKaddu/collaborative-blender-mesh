@@ -4,6 +4,13 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { CacheService } from '../services/cacheService.js';
 import { MsgPackProtocol } from '../protocols/msgpack.js'; // 1. Import your new protocol wrapper
 import {OperationService} from '../services/operationService.js'
+import {RoomCleanupService} from '../services/roomCleanupService.js'
+
+const roomCleanupTimers = new Map<
+    string,
+    NodeJS.Timeout
+>();
+
 
 function shouldPersist(packet: any): boolean {
     const persistentTypes = new Set([
@@ -40,13 +47,18 @@ export function initWebSocketServer(server: HttpServer): void {
 
     wss.on('connection', (ws: CollabSocket) => {
         console.log('🔌 Blender binary channel established successfully.');
+        ws.send(MsgPackProtocol.pack({
+            type: "connectionStatus",
+            status: "ready"
+        }))
+        console.log("send connection stats to client ")
 
         // 2. Change the incoming listener argument type to read raw data chunks
         ws.on('message', async (message: Buffer) => {
             try {
                 // 3. Unpack the incoming MessagePack binary frame back into a JSON object
                 const packet = MsgPackProtocol.unpack(message);
-
+                console.log(packet)
                 const { type, room_id, client_id } = packet;
                 if (!ws.roomId && type !== 'join') {
                     console.warn(
@@ -78,6 +90,18 @@ export function initWebSocketServer(server: HttpServer): void {
                 switch (type) {
                     case 'join': {
                         const activeRoom = await CacheService.getRoomState(room_id);
+                        
+                        const cleanupTimer = roomCleanupTimers.get(room_id);
+
+                        if (cleanupTimer) {
+                            clearTimeout(cleanupTimer);
+
+                            roomCleanupTimers.delete(
+                                room_id
+                            );
+
+                            console.log(`🟢 Cleanup cancelled for Room [${room_id}] because someone joined.`);
+                        }
                         if (!activeRoom) {
                             // If an error happens, we still send a packed binary message back
                             ws.send(MsgPackProtocol.pack({ 
@@ -187,5 +211,21 @@ function checkRoomVacancy(wss: WebSocketServer, roomId: string): void {
     });
     if (occupants === 0) {
         console.log(`🥀 All clients have disconnected from Room [${roomId}]. Redis cache will auto-expire.`);
+        if (!roomCleanupTimers.has(roomId)) {
+            const timer = setTimeout(async () => {
+                await RoomCleanupService.cleanupRoom(
+                    roomId
+                );
+
+                roomCleanupTimers.delete(
+                    roomId
+                );
+            }, 5 * 60 * 1000);
+
+            roomCleanupTimers.set(
+                roomId,
+                timer
+            );
+}
     }
 }

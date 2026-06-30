@@ -3,6 +3,7 @@ import queue
 import time
 from . import config
 from . import lock_visualization
+from . import protocol_packer
 
 # ====================================================================
 # 1. ADVANCED DATA-BLOCK FACTORY HELPERS

@@ -21,7 +21,8 @@ LAST_FRAME_TIME = 0
 THROTTLE_INTERVAL = 0.033  # ~30hz
 
 # Connection Settings
-SERVER_URL = "ws://localhost:8765"
+SERVER_URL = "http://localhost:8080"
+WS_URL = "ws://localhost:8080"
 CLIENT_ID = "LOCAL_DEV_USER"
 
 # Room & Session Management

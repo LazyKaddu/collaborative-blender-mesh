@@ -1,14 +1,34 @@
 import json
 # In production, you will run: pip install msgpack inside Blender's python binary
+
+import sys
+sys.path.append(
+    r"C:\Users\aashi\AppData\Roaming\Python\Python313\site-packages"
+)
 try:
     import msgpack
     HAS_MSGPACK = True
 except ImportError:
-    HAS_MSGPACK = False
+    import subprocess
+    import sys
+    print("msg pack is not installed installing")
+    subprocess.check_call([
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "msgpack"
+    ])
+    print("msg pack installed")
+
+    import msgpack
+    HAS_MSGPACK = True
 
 def pack_operation(op_dict):
     """Converts a live operational dictionary into binary wire formats."""
+
     if HAS_MSGPACK:
+        print(op_dict)
         return msgpack.packb(op_dict, use_bin_type=True)
     else:
         # Robust fallback tracking for local development debugging

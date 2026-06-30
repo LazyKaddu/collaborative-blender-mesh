@@ -1,5 +1,6 @@
 import bpy
 from . import network_client, config
+from . import protocol_packer
 
 def network_sync_tick():
     # 1. Drain the outbound queue (what the user changed)
@@ -7,7 +8,8 @@ def network_sync_tick():
         op = config.OUTBOUND_QUEUE.get()
         # Add room context to operation
         op["room_id"] = config.ROOM_ID
-        network_client.client.send_operation(op)
+        packed_op = protocol_packer.pack_operation(op)
+        network_client.client.send_operation(packed_op)
         config.OUTBOUND_QUEUE.task_done()
     
     # 2. Trigger the inbound executor (what the server sent back)

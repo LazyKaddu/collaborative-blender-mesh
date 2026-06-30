@@ -50,6 +50,7 @@ class CollabAPIClient:
     def download_file(self, download_url, target_path):
         """Downloads the baseline snapshot GLB to your local temp directory."""
         try:
+            print(f"download url: {download_url}")
             response = requests.get(download_url, stream=True, timeout=60)
             if response.status_code == 200:
                 with open(target_path, 'wb') as f:
@@ -60,7 +61,7 @@ class CollabAPIClient:
         except Exception as e:
             print(f"[COLLAB API ERROR] Download failed: {e}")
             return False
-    def get_room_history(room_id):
+    def get_room_history(self,room_id):
         response = requests.get(
             f"{self.base_url}/api/operation/history/{room_id}"
         )

@@ -3,6 +3,7 @@ import threading
 import json
 import time
 from . import config
+from . import protocol_packer
 
 class CollabNetworkClient:
     def __init__(self, server_url):
@@ -31,14 +32,28 @@ class CollabNetworkClient:
 
     def on_message(self, ws, message):
         """Routes incoming packets into the Blender inbound queue."""
-        data = json.loads(message)
-        print("data recieved from websocket ",data)
-        config.INBOUND_QUEUE.put(data)
+        data = protocol_packer.unpack_operation(message)
+        print(data)
+        op_type = data.get("type")
+
+        if op_type == "connectionStatus":
+            join_packet = {
+                "type": "join",
+                "room_id": config.ROOM_ID,
+                "client_id": config.CLIENT_ID
+            }
+
+            join_packet_packed = protocol_packer.pack_operation(join_packet)
+            self.send_operation(join_packet_packed)
+        
+        else:
+            print("data recieved from websocket ",data)
+            config.INBOUND_QUEUE.put(data)
 
     def send_operation(self, op):
         """Outgoing pipe for local operations."""
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            self.ws.send(json.dumps(op))
+            self.ws.send(op, opcode=websocket.ABNF.OPCODE_BINARY)
 
     def on_error(self, ws, error):
         print(f"[COLLAB NETWORK ERROR]: {error}")
@@ -48,4 +63,4 @@ class CollabNetworkClient:
         print("[COLLAB NETWORK] Connection closed.")
 
 # --- Singleton Instance ---
-client = CollabNetworkClient(config.SERVER_URL)
+client = CollabNetworkClient(config.WS_URL)

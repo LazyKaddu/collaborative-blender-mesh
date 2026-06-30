@@ -50,6 +50,7 @@ router.post('/create', async (req: Request, res: Response): Promise<any> => {
         });
 
         console.log(`Room [${roomId}] pre-signed out to Client [${client_id}]`);
+        console.log(`pre-signed url - ${downloadUrl}`)
 
         // Return EXACT signature your Python script expects: { room_id, upload_url, download_url }
         return res.status(201).json({
@@ -91,8 +92,19 @@ router.get('/join/:roomId', async (req: Request, res: Response): Promise<any> =>
     }
 });
 
+// todo : complete the api route flush and then add the update room metadata route
 
+// router.get('/flush/:roomId', async (req: Request, res: Response): Promise<any> => {
+//     try {
+//         const roomId = req.params.roomId as string;
 
+//         const activeRoom = await CacheService.getRoomState(roomId);
+
+//         if (!activeRoom) {
+//             return res.status(404).json({ error: 'Session not found or has expired.' });
+//         }
+
+//         console.log(`👥 Metadata rehydrated for Room [${roomId}]`);
 
 
 

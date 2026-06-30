@@ -9,9 +9,10 @@ from . import config
 from . import network_client
 from . import sync_loop
 from .core_handlers import register_handlers  # 🚀 Added handler hook
+from . import protocol_packer
 
 # Initialize our API client instance globally within the module
-api = CollabAPIClient()
+api = CollabAPIClient(base_url=config.SERVER_URL)
 
 # ====================================================================
 # PROPERTY GROUP FOR UI STATE PERSISTENCE
@@ -28,7 +29,7 @@ class MultiuserCollabProperties(bpy.types.PropertyGroup):
     server_url: bpy.props.StringProperty(
         name="Server URL",
         description="WebSocket server address",
-        default="http://localhost:8080"
+        default=config.SERVER_URL
     )
     
     client_name: bpy.props.StringProperty(
@@ -119,17 +120,14 @@ class MULTIUSER_OT_create_room(bpy.types.Operator):
                     
                     # 1. Seed historical baseline vectors right now 🚀
                     scene_manager.prime_local_collaboration_cache()
-                    
+
+                    #setting roomID in config
+                    config.ROOM_ID = props.room_id
+
                     # 2. Connect client engine to websocket cluster
-                    network_client.client.server_url = "ws://localhost:8765"
+                    network_client.client.server_url = config.WS_URL
                     network_client.client.connect()
-                    
-                    # 3. Transmit structural identity payload map
-                    network_client.client.send_operation({
-                        "type": "join",
-                        "room_id": props.room_id,
-                        "client_id": config.CLIENT_ID
-                    })
+
                     
                     # 4. Turn on viewport capture loops
                     register_handlers()
@@ -194,16 +192,13 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
                 print("connection: ",self._status)
                 if self._status == "SUCCESS":
 
+                    # configuring the room
+                    config.ROOM_ID = props.room_id
 
-                    network_client.client.server_url = "ws://localhost:8765"
+                    # connecting to websocket server
+                    network_client.client.server_url = config.WS_URL
                     network_client.client.connect()
                     
-                    # 3. Transmit structural identity payload map
-                    network_client.client.send_operation({
-                        "type": "join",
-                        "room_id": props.room_id,
-                        "client_id": config.CLIENT_ID
-                    })
                     
                     # Wiping scene and reading snapshot must run on the main thread for safety
                     scene_manager.clear_entire_scene()
@@ -214,22 +209,38 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
                     # 1. Seed historical baseline vectors right after scene finishes importing! 🚀
                     scene_manager.prime_local_collaboration_cache()
 
-                    history_response = api.get_room_history(props.room_id)
-
-                    operations = history_response.get("operations", [])
+                    operations = api.get_room_history(props.room_id)
 
                     operations.sort(key=lambda op: op["seq"])
 
-                    if config.INBOUND_QUEUE:
-                        first_live_seq = config.INBOUND_QUEUE[0]["seq"]
+                    # with config.INBOUND_QUEUE.mutex:
+    
+                    #     if config.INBOUND_QUEUE.Queue:
+                    #         # Safely peek since we own the lock
+                    #         first_live_seq = config.INBOUND_QUEUE.queue[0]["seq"]
 
-                        operations = [
-                            op for op in operations
-                            if op["seq"] < first_live_seq
-                        ]
-                    for op in reversed(operations):
-                        config.INBOUND_QUEUE.appendleft(op)
+                    #         operations = [
+                    #             op for op in operations
+                    #             if op["seq"] < first_live_seq
+                    #             ]
 
+                    #     if operations:
+                    #         temp_queue = queue.Queue()
+
+                    #         # 1. Insert history
+                    #         for op in operations:
+                    #             temp_queue.put(op)
+
+                    #         # 2. Drain live items (No one can add anything new right now!)
+                    #         while not config.INBOUND_QUEUE.empty():
+                    #             try:
+                    #                 temp_queue.put(config.INBOUND_QUEUE.get_nowait())
+                    #             except queue.Empty:
+                    #                 break
+
+                    #         # 3. Swap instances safely while still under lock protection
+                    #         config.INBOUND_QUEUE = temp_queue
+                    
                     props.is_connected = True
                     self.report({'INFO'}, f"Synchronized with Room: {props.room_id}")
                     
@@ -326,7 +337,7 @@ class MULTIUSER_OT_flush_update(bpy.types.Operator):
             return {'CANCELLED'}
             
         self.report({'INFO'}, "Capturing fresh workspace state...")
-        filepath, filename = scene_manager.export_draco_snapshot()
+        filepath, filename = scene_manager.export_usd_snapshot()
         
         # Step 1: Request a fresh upload URL specifically for an existing room update
         try:
