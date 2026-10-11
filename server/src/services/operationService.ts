@@ -1,10 +1,7 @@
 // src/services/operationService.ts
-import redisClient from '../config/redis.js';
+import { redisClient } from '../config/redis.js';
 
 export class OperationService {
-    static getOpKey(roomId: string) {
-        return `room:${roomId}:operations`;
-    }
 
     static getSeqKey(roomId: string) {
         return `room:${roomId}:seq`;
@@ -19,7 +16,7 @@ export class OperationService {
 
         await redisClient.expire(
             this.getSeqKey(roomId),
-            7200
+            86400
         );
 
         return seq;
@@ -30,21 +27,6 @@ export class OperationService {
         );
 
         return Number(seq ?? 0);
-    }
-
-    static async appendOperation(
-        roomId: string,
-        operation: any
-    ): Promise<void> {
-        await redisClient.rPush(
-            this.getOpKey(roomId),
-            JSON.stringify(operation)
-        );
-
-        await redisClient.expire(
-            this.getOpKey(roomId),
-            7200
-        );
     }
 }
 
