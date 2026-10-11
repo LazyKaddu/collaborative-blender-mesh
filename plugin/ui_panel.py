@@ -10,6 +10,8 @@ from . import network_client
 from . import sync_loop
 from .core_handlers import register_handlers  # 🚀 Added handler hook
 from . import protocol_packer
+import requests
+import base64
 
 # Initialize our API client instance globally within the module
 api = CollabAPIClient(base_url=config.SERVER_URL)
@@ -144,10 +146,10 @@ class MULTIUSER_OT_create_room(bpy.types.Operator):
         api.base_url = props.server_url  # Bind base client to match user's UI config entry
         
         self.report({'INFO'}, "Compressing workspace with Draco...")
-        filepath, filename = scene_manager.export_usd_snapshot()
-        
+        filepath, filename = scene_manager.export_glb_snapshot()
+        mesh_data = scene_manager.generate_scene_mesh_data()
         # Request access ticket from the Express server
-        ticket = api.create_room(filename)
+        ticket = api.create_room(filename,mesh_data)
         if not ticket:
             self.report({'ERROR'}, "Express API connection dropped.")
             return {'CANCELLED'}
@@ -179,10 +181,13 @@ class MULTIUSER_OT_create_room(bpy.types.Operator):
 class MULTIUSER_OT_join_room(bpy.types.Operator):
     bl_idname = "multiuser.join_room"
     bl_label = "Join Room"
-    
+
+    _obj_topo_correction_data = []
+    _history_pointer = 0
     _thread = None
     _status = "IDLE"
     _meta_cache = None
+
 
     def modal(self, context, event):
         if event.type == 'TIMER':
@@ -204,42 +209,28 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
                     scene_manager.clear_entire_scene()
                     
                     temp_path = os.path.join(bpy.app.tempdir, "incoming_baseline.usd")
-                    scene_manager.import_usd_snapshot(temp_path)
+                    scene_manager.import_glb_snapshot(temp_path)
                     
                     # 1. Seed historical baseline vectors right after scene finishes importing! 🚀
                     scene_manager.prime_local_collaboration_cache()
 
-                    operations = api.get_room_history(props.room_id)
+                    operations = api.get_room_history(props.room_id,self._history_pointer)
 
                     operations.sort(key=lambda op: op["seq"])
 
-                    # with config.INBOUND_QUEUE.mutex:
-    
-                    #     if config.INBOUND_QUEUE.Queue:
-                    #         # Safely peek since we own the lock
-                    #         first_live_seq = config.INBOUND_QUEUE.queue[0]["seq"]
+                    if config.INBOUND_QUEUE:
+                        print("This is the inbound queue befor error: ",config.INBOUND_QUEUE)
+                        first_live_seq = config.INBOUND_QUEUE[0]["seq"]
 
-                    #         operations = [
-                    #             op for op in operations
-                    #             if op["seq"] < first_live_seq
-                    #             ]
+                        operations = [
+                            op for op in operations
+                            if op["seq"] < first_live_seq
+                        ]
 
-                    #     if operations:
-                    #         temp_queue = queue.Queue()
-
-                    #         # 1. Insert history
-                    #         for op in operations:
-                    #             temp_queue.put(op)
-
-                    #         # 2. Drain live items (No one can add anything new right now!)
-                    #         while not config.INBOUND_QUEUE.empty():
-                    #             try:
-                    #                 temp_queue.put(config.INBOUND_QUEUE.get_nowait())
-                    #             except queue.Empty:
-                    #                 break
-
-                    #         # 3. Swap instances safely while still under lock protection
-                    #         config.INBOUND_QUEUE = temp_queue
+                    operations = self._obj_topo_correction_data + operations
+                    print(operations)
+                    for op in operations:
+                        config.INBOUND_QUEUE.appendleft(op)
                     
                     props.is_connected = True
                     self.report({'INFO'}, f"Synchronized with Room: {props.room_id}")
@@ -271,6 +262,8 @@ class MULTIUSER_OT_join_room(bpy.types.Operator):
             self.report({'ERROR'}, "Target Room doesn't exist or server timed out.")
             return {'CANCELLED'}
 
+        self._obj_topo_correction_data = [protocol_packer.unpack_operation(base64.b64decode(chunk)) for chunk in meta["mesh_data"]]
+        self._history_pointer = meta["history_pointer"]
         download_url = meta["download_url"]
         config.SNAPSHOT_TIMESTAMP = meta["timestamp"]
 
@@ -300,8 +293,8 @@ class MULTIUSER_OT_disconnect_session(bpy.types.Operator):
         
         # Stop sync loop and close WebSocket connection
         sync_loop.stop_sync()
-        if network_client.client.ws:
-            network_client.client.ws.close()
+        if network_client.client.sio:
+            network_client.client.sio.disconnect()
             network_client.client.is_running = False
         
         self.report({'INFO'}, "Disconnected from room.")
@@ -323,7 +316,7 @@ class MULTIUSER_OT_flush_update(bpy.types.Operator):
                 if self._status == "SUCCESS":
                     self.report({'INFO'}, "Global scene state flushed and synchronized safely!")
                 else:
-                    self.report({'ERROR'}, "Failed to flush current workspace state to cloud storage.")
+                    self.report({'ERROR'}, f"Failed to flush current workspace state to cloud storage.{self._status}")
                 return {'FINISHED'}
             
         return {'PASS_THROUGH'}
@@ -337,37 +330,32 @@ class MULTIUSER_OT_flush_update(bpy.types.Operator):
             return {'CANCELLED'}
             
         self.report({'INFO'}, "Capturing fresh workspace state...")
-        filepath, filename = scene_manager.export_usd_snapshot()
-        
+        filepath, filename = scene_manager.export_glb_snapshot()
+        mesh_data = scene_manager.generate_scene_mesh_data()
         # Step 1: Request a fresh upload URL specifically for an existing room update
-        try:
-            import requests
-            url = f"{props.server_url}/api/room/flush"
-            response = requests.post(url, json={
-                "room_id": props.room_id,
-                "filename": filename,
-                "client_id": api.client_id
-            }, timeout=10)
-            ticket = response.json()
-        except Exception as e:
-            print(f"[COLLAB API ERROR] Flush request failed: {e}")
-            self.report({'ERROR'}, "Express server unreachable.")
-            return {'CANCELLED'}
-            
-        if "upload_url" not in ticket:
-            self.report({'ERROR'}, "Server denied state overwrite permissions.")
-            return {'CANCELLED'}
-            
+        ticket = api.flush_update(filename,props.room_id)
+
         upload_url = ticket["upload_url"]
+        latest_pointer = ticket["latest_seq"]
 
         # Step 2: Thread out the upload to keep the viewports completely fluid
         def flush_worker():
+            # 1. Background binary pipe stream uploads using `upload_url`
             if api.upload_file(upload_url, filepath):
-                self._status = "SUCCESS"
-                try: os.remove(filepath)
-                except: pass
+                # 2. Upload success! Now trigger metadata sync & old asset deletion
+                try:
+                    update_url = f"{props.server_url}/api/room/update-metadata/{props.room_id}"
+                    requests.put(update_url, json={
+                        "future_filename": ticket["future_filename"],
+                        "mesh_data": mesh_data,
+                        "historyPointer": latest_pointer,
+                    }, timeout=10)
+                    self._status = "SUCCESS"
+                except Exception as e:
+                    print(f"exception occur at meta data sync {e}")
+                    self._status = "METADATA_SYNC_FAILED"
             else:
-                self._status = "FAILED"
+                self._status = "UPLOAD_FAILED"
 
         self._thread = threading.Thread(target=flush_worker, daemon=True)
         self._thread.start()
