@@ -10,7 +10,7 @@ def mock_network_worker():
     while config.IS_NETWORK_ALIVE:
         # 1. OUTBOUND HANDLING (What we send to server)
         try:
-            operation = config.OUTBOUND_QUEUE.get_nowait()
+            operation = config.OUTBOUND_QUEUE.popleft()
             
             try:
                 # Attempt to pack the operation into wire format
@@ -25,9 +25,8 @@ def mock_network_worker():
                 print(f"[Network Thread ERROR] Failed to pack operation layout: {packing_err}")
                 traceback.print_exc()
             
-            config.OUTBOUND_QUEUE.task_done()
             
-        except queue.Empty:
+        except IndexError:
             pass
 
         # 2. INBOUND HANDLING MOCK
