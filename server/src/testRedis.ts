@@ -1,6 +1,6 @@
 // src/testRedis.ts
 import { CacheService } from './services/cacheService.js';
-import redisClient from './config/redis.js';
+import { redisClient } from './config/redis.js';
 
 async function verifyCacheLayer() {
     console.log("⏳ Initializing Memory Layer Test Sequence...");
