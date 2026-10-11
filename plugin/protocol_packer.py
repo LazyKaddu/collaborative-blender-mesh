@@ -7,6 +7,7 @@ sys.path.append(
 )
 try:
     import msgpack
+    import zstandard as zstd
     HAS_MSGPACK = True
 except ImportError:
     import subprocess
@@ -40,3 +41,13 @@ def unpack_operation(binary_payload):
         return msgpack.unpackb(binary_payload, raw=False)
     else:
         return json.loads(binary_payload.decode('utf-8'))
+
+def compress_data(input_binary):
+    cctx = zstd.ZstdCompressor(level=3)
+    compressed = cctx.compress(input_binary)
+    return compressed
+
+def decompress_data(input_compressed):
+    dctx = zstd.ZstdDecompressor()
+    decompressed = dctx.decompress(input_compressed)
+    return decompressed
