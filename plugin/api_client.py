@@ -1,6 +1,7 @@
 import requests
 import uuid
 from . import config
+import base64
 
 class CollabAPIClient:
     def __init__(self, base_url="http://localhost:8080"):
@@ -11,13 +12,14 @@ class CollabAPIClient:
         config.CLIENT_ID = self.client_id
 
 
-    def create_room(self, filename):
+    def create_room(self, filename, mesh_data):
         """Asks Express for an upload ticket (Pre-signed URL)."""
         try:
             url = f"{self.base_url}/api/room/create"
             response = requests.post(url, json={
                 "filename": filename, 
-                "client_id": self.client_id
+                "client_id": self.client_id,
+                "mesh_data": mesh_data,
             }, timeout=10)
             return response.json() # Expects: { room_id, upload_url, download_url }
         except Exception as e:
@@ -61,12 +63,34 @@ class CollabAPIClient:
         except Exception as e:
             print(f"[COLLAB API ERROR] Download failed: {e}")
             return False
-    def get_room_history(self,room_id):
+    def get_room_history(self,room_id,history_pointer):
         response = requests.get(
-            f"{self.base_url}/api/operation/history/{room_id}"
+            f"{self.base_url}/api/operation/history/{room_id}/{history_pointer}"
         )
 
         if response.status_code != 200:
             return []
 
         return response.json()["operations"]
+
+    def flush_update(self,filename,room_id):
+        try:
+            url = f"{self.base_url}/api/room/flush/{room_id}"
+            response = requests.post(url, json={
+                "filename": filename,
+            }, timeout=10)
+            ticket = response.json()
+
+        except Exception as e:
+            print(f"[COLLAB API ERROR] Flush request failed: {e}")
+            self.report({'ERROR'}, "Express server unreachable.")
+            return {'CANCELLED'}
+            
+        if "upload_url" not in ticket:
+            self.report({'ERROR'}, "Server denied state overwrite permissions.")
+            return {'CANCELLED'}
+            
+        return ticket
+
+
+
