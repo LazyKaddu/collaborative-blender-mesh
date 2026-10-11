@@ -2,6 +2,7 @@ import bpy
 import time
 import traceback
 from . import config
+from . import scene_manager
 from .lock_visualization import (
     apply_remote_lock,
     lift_remote_lock,
@@ -77,6 +78,7 @@ def generate_state_resync_packet(obj):
         "scale": tuple(obj.scale)
     }
 
+
 # ====================================================================
 # 2. DISCRETE COMMAND SNIFFER & UNDO CONTROLLER
 # ====================================================================
@@ -114,7 +116,7 @@ def universal_macro_sniffer(*args):
     try:
         print(f"🎬 [COLLAB SNIFFER] Universally caught local action: {op.bl_idname}")
         packet = generate_operator_packet(op, bpy.context)
-        config.OUTBOUND_QUEUE.put(packet)
+        config.OUTBOUND_QUEUE.append(packet)
     except Exception as e:
         print(f"❌ [COLLAB SNIFFER ERROR] Failed to parse local operator: {e}")
 
@@ -142,7 +144,7 @@ def unified_command_sniffer(op, context):
         print(f"🎬 [COLLAB SNIFFER] Local Action caught: {op.bl_idname}")
         if (op.bl_idname not in config.RESTRICTED_COMMANDS):
             packet = generate_operator_packet(op, context)
-            config.OUTBOUND_QUEUE.put(packet)
+            config.OUTBOUND_QUEUE.append(packet)
     except Exception as e:
         print(f"❌ [COLLAB SNIFFER ERROR] Failed to serialize local operator: {e}")
 
@@ -158,7 +160,7 @@ def local_undo_redo_handler(scene):
         try:
             print(f"⏪ [UNDO/REDO EVENT] Local history shift caught. Resyncing object: {active_obj.name}")
             packet = generate_state_resync_packet(active_obj)
-            config.OUTBOUND_QUEUE.put(packet)
+            config.OUTBOUND_QUEUE.append(packet)
         except Exception as e:
             print(f"❌ [COLLAB HISTORY ERROR] Failed to broadcast state rollback: {e}")
 
@@ -189,18 +191,9 @@ def tracking_and_lock_evaluator(scene, depsgraph):
             # Detect the sharp transition out of Edit Mode back into Object Mode
             if LAST_KNOWN_MODE == 'EDIT' and current_mode == 'OBJECT':
                 try:
-                    mesh = active_obj.data
-                    vertex_coords = [tuple(v.co) for v in mesh.vertices]
-                    
-                    commit_packet = {
-                        "type": "BMESH_COMMIT_SYNC",
-                        "op_id": int(time.time_ns()),
-                        "client_id": config.CLIENT_ID,
-                        "target": active_obj.name,
-                        "vertices": vertex_coords
-                    }
-                    config.OUTBOUND_QUEUE.put(commit_packet)
-                    print(f"📦 [COLLAB COMMIT] Edit Mode exited. Committing raw topology vectors for {active_obj.name} ({len(vertex_coords)} vertices).")
+                    packet = scene_manager.generate_edit_sync_pack(active_obj)
+                    config.OUTBOUND_QUEUE.append(packet)
+                    print(f"📦 [COLLAB COMMIT] Edit Mode exited. Committing raw topology vectors for {active_obj.name} ).")
                 except Exception as bmesh_err:
                     print(f"❌ [COLLAB COMMIT ERROR] Failed to package mesh snapshot: {bmesh_err}")
             
@@ -220,7 +213,7 @@ def tracking_and_lock_evaluator(scene, depsgraph):
                 print(f"🔓 [COLLAB LOCK] Releasing lock asset: {entity_id}")
                 
                 sync_packet = generate_state_resync_packet(obj)
-                config.OUTBOUND_QUEUE.put(sync_packet)
+                config.OUTBOUND_QUEUE.append(sync_packet)
                 
                 unlock_packet = {
                     "type": "LOCK_TRANSACTION",
@@ -228,7 +221,7 @@ def tracking_and_lock_evaluator(scene, depsgraph):
                     "target": entity_id,
                     "action": "RELEASE"
                 }
-                config.OUTBOUND_QUEUE.put(unlock_packet)
+                config.OUTBOUND_QUEUE.append(unlock_packet)
                 config.LOCAL_LOCKS.discard(entity_id)
         
         # 🔒 Handle New Selections
@@ -241,7 +234,7 @@ def tracking_and_lock_evaluator(scene, depsgraph):
                 "target": entity_id,
                 "action": "ACQUIRE_EXCLUSIVE"
             }
-            config.OUTBOUND_QUEUE.put(lock_packet)
+            config.OUTBOUND_QUEUE.append(lock_packet)
             config.LOCAL_LOCKS.add(entity_id)
             
         config.SELECTED_OBJECTS_CACHE = current_selected
@@ -260,7 +253,7 @@ def flush_active_locks():
             "target": entity_id,
             "action": "RELEASE"
         }
-        config.OUTBOUND_QUEUE.put(lock_packet)
+        config.OUTBOUND_QUEUE.append(lock_packet)
         
     config.SELECTED_OBJECTS_CACHE.clear()
     config.LOCAL_LOCKS.clear()
