@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // Initialize the Redis client instance mapping
-const redisClient = createClient({
+export const redisClient = createClient({
     url: process.env.REDIS_URL || 'redis://127.0.0.1:6379'
 });
 
@@ -16,11 +16,23 @@ redisClient.on('connect', () => {
     console.log('📦 Redis Cache Engine connected successfully.');
 });
 
+export const pubClient = redisClient.duplicate();
+export const subClient = redisClient.duplicate();
+
 // Immediately Invoked Execution function to connect to the memory grid automatically
-(async () => {
+export async function connectRedis() {
     if (!redisClient.isOpen) {
         await redisClient.connect();
     }
-})();
 
-export default redisClient;
+    if (!pubClient.isOpen) {
+        await pubClient.connect();
+    }
+
+    if (!subClient.isOpen) {
+        await subClient.connect();
+    }
+
+    console.log("🚀 Redis (main + pub + sub) fully connected");
+}
+
