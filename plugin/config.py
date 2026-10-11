@@ -1,8 +1,10 @@
-import queue
+from collections import deque
+from threading import Lock
 
 # Core network pipelines
-OUTBOUND_QUEUE = queue.Queue()
-INBOUND_QUEUE = queue.Queue()
+OUTBOUND_QUEUE = deque()
+INBOUND_QUEUE = deque()
+INBOUND_QUEUE_LOCK = Lock()
 
 # Thread gates and operational state flags
 IS_NETWORK_ALIVE = False
@@ -21,8 +23,8 @@ LAST_FRAME_TIME = 0
 THROTTLE_INTERVAL = 0.033  # ~30hz
 
 # Connection Settings
-SERVER_URL = "http://localhost:8080"
-WS_URL = "ws://localhost:8080"
+SERVER_URL = "http://localhost:80"
+WS_URL = "http://localhost:80"
 CLIENT_ID = "LOCAL_DEV_USER"
 
 # Room & Session Management
