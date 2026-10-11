@@ -4,6 +4,7 @@ import time
 from . import config
 from . import lock_visualization
 from . import protocol_packer
+import bmesh
 
 # ====================================================================
 # 1. ADVANCED DATA-BLOCK FACTORY HELPERS
@@ -41,6 +42,80 @@ def spawn_remote_primitive(entity_id, obj_type):
         print(f"[COLLAB ERROR] Failed to factory spawn entity {entity_id}: {str(e)}")
         return None
 
+
+
+
+
+def refactor_mesh(op):
+    try:
+        target_name = op.get("target")
+        compressed_geom = op.get("compressed_geom")
+
+        if target_name not in bpy.data.objects:
+            print("⚠️ mesh is not present in the scene")
+            return False
+
+        remote_obj = bpy.data.objects[target_name]
+
+        if remote_obj.type != "MESH":
+            print("Incoming reomte object is not mesh")
+            return False
+
+        #Operation lock
+        config.IS_PROCESSING_REMOTE_OP = True
+
+        #decompressing the incoming data
+
+        decompressed_geom_bytes = protocol_packer.decompress_data(compressed_geom)
+
+        #unpacking the data
+
+        geom_data = protocol_packer.unpack_operation(decompressed_geom_bytes)
+        incoming_verts = geom_data.get("v", [])
+        incoming_faces = geom_data.get("f", [])
+        mesh_data = remote_obj.data
+
+
+        #creating a new mesh data
+        bm = bmesh.new()
+        bm.clear()
+
+        #syncing the vertices
+        for coords in incoming_verts:
+            bm.verts.new(coords)
+        bm.verts.ensure_lookup_table()
+
+        #sync the faces data
+        for face_indices in incoming_faces:
+            try:
+                bm.faces.new([bm.verts[idx] for idx in face_indices])
+            except Exception:
+                pass
+
+        bm.to_mesh(mesh_data)
+        bm.free()
+
+        mesh_data.update()
+        bpy.context.view_layer.update()
+
+        config.IS_PROCESSING_REMOTE_OP = False
+
+        for area in bpy.context.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+        print(
+            f"⚡ [COLLAB SYNC SUCCESS] Rebuilt '{target_name}' with pristine quads via streaming zstd payload."
+        )
+        return True
+
+    except Exception as e:
+        print(f"❌ [COLLAB SYNC CRASH] Failed to process inbound binary mesh: {e}")
+        config.IS_PROCESSING_REMOTE_OP = False
+        return False
+
+
+
 # ====================================================================
 # 2. UNIFIED DISCRETE COMMAND EXECUTOR ENGINE
 # ====================================================================
@@ -53,7 +128,7 @@ def execute_inbound_operations():
     start_time = time.perf_counter()
     FRAME_BUDGET = 0.003  # 🚀 Hard 3ms allocation gate to prevent viewport stutters
 
-    while not config.INBOUND_QUEUE.empty():
+    while config.INBOUND_QUEUE:
         print("inbound queue is not empty")
         # ⏱️ Budget Check: Yield immediately to keep local mouse inputs ultra-fluid
         if (time.perf_counter() - start_time) > FRAME_BUDGET:
@@ -61,13 +136,12 @@ def execute_inbound_operations():
             break
 
         try:
-            op = config.INBOUND_QUEUE.get_nowait()
+            op = config.INBOUND_QUEUE.popleft()
             client_id = op.get("client_id")
-            
+            print("incoming operator :",op)
             # Discard mirrors of our own transmissions
             if client_id == config.CLIENT_ID:
                 print("getting rid of echo operations")
-                config.INBOUND_QUEUE.task_done()
                 continue
             
             op_type = op.get("type")
@@ -85,7 +159,6 @@ def execute_inbound_operations():
                 obj.scale = op.get("scale", obj.scale)
                 
                 bpy.context.view_layer.update()
-                config.INBOUND_QUEUE.task_done()
                 continue
 
             # ─── CORE ROUTE B: LOCK TRANSACTION HANDLERS ───
@@ -96,8 +169,7 @@ def execute_inbound_operations():
                     lock_visualization.apply_remote_lock(target_name, owner_name)
                 elif action == "RELEASE":
                     lock_visualization.lift_remote_lock(target_name)
-                
-                config.INBOUND_QUEUE.task_done()
+
                 continue
 
             # ─── CORE ROUTE C: UNIFIED COMMAND INJECTION EXECUTOR ───
@@ -111,7 +183,6 @@ def execute_inbound_operations():
 
                 if not target_name:
                     print("⚠️ [INBOUND EXEC] Packet discarded: missing 'target' key allocation.")
-                    config.INBOUND_QUEUE.task_done()
                     continue
 
                 if target_name not in bpy.data.objects:
@@ -123,7 +194,6 @@ def execute_inbound_operations():
                     obj = bpy.data.objects[target_name]
 
                 if not obj:
-                    config.INBOUND_QUEUE.task_done()
                     continue
 
                 config.IS_PROCESSING_REMOTE_OP = True
@@ -181,46 +251,16 @@ def execute_inbound_operations():
                     config.IS_PROCESSING_REMOTE_OP = False
 
                 bpy.context.view_layer.update()
-                config.INBOUND_QUEUE.task_done()
                 continue
 
             # ─── 🚀 CORE ROUTE D: TRANSACTION GEOMETRY INJECTION (BMESH COMMIT) ───
             if op_type == "BMESH_COMMIT_SYNC":
-                incoming_verts = op.get("vertices", [])
                 
-                if target_name in bpy.data.objects and incoming_verts:
-                    remote_obj = bpy.data.objects[target_name]
-                    
-                    if remote_obj.type == 'MESH':
-                        mesh_data = remote_obj.data
-                        config.IS_PROCESSING_REMOTE_OP = True
-                        
-                        try:
-                            # Verify structural topology sizes align before raw coordinate writing
-                            if len(mesh_data.vertices) == len(incoming_verts):
-                                print(f"⚡ [INBOUND COMMIT] Fast-aligned mesh coordinates directly for: {target_name}")
-                                for i, v in enumerate(mesh_data.vertices):
-                                    v.co = incoming_verts[i]
-                            else:
-                                print(f"⚠️ [INBOUND COMMIT] Structural geometry changes caught (vertex mismatch: {len(mesh_data.vertices)} local vs {len(incoming_verts)} remote) on {target_name}. Skipping mapping.")
-                                # (Optional placeholder for asset snapshot reload engine fallback here)
-                                
-                        except Exception as commit_err:
-                            print(f"❌ [INBOUND COMMIT ERROR] Geometric application collapsed: {commit_err}")
-                        finally:
-                            config.IS_PROCESSING_REMOTE_OP = False
-                            
-                        bpy.context.view_layer.update()
-                        
-                        # Trigger an instant viewport redraw so your friend sees the geometry change smoothly
-                        for area in bpy.context.screen.areas:
-                            if area.type == 'VIEW_3D':
-                                area.tag_redraw()
+                refactor_mesh(op)
 
-                config.INBOUND_QUEUE.task_done()
                 continue
 
-        except queue.Empty:
+        except IndexError:
             break
         except Exception as e:
             print(f"❌ [COLLAB INBOUND CRITICAL ERROR]: {e}")

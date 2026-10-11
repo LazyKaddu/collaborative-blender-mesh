@@ -1,8 +1,10 @@
 import os
 import time
 from . import config
+from . import protocol_packer
 import bpy
-
+import bmesh
+import base64
 
 def serialize_node_tree(node_tree):
     """Deep serializes an entire node tree's layout, properties, and links into JSON-safe dictionaries."""
@@ -81,35 +83,60 @@ def generate_batch_unlock_op(obj):
     }
 
 
-def export_usd_snapshot():
-    timestamp = int(time.time())
-    filename = f"scene_{timestamp}.usd"
-    filepath = os.path.join(bpy.app.tempdir, filename)
 
-    bpy.ops.wm.usd_export(
-        filepath=filepath,
+def generate_scene_mesh_data():
+    scene = bpy.context.scene
 
-        export_meshes=True,
-        export_lights=True,
-        export_cameras=True,
-        export_materials=True,
-        export_uvmaps=True,
-        export_normals=True,
-        export_mesh_colors=True,
-        export_custom_properties=True,
-        export_animation=True,
+    mesh_data = []
+    for obj in scene.objects:
+        if obj.type == "MESH":
+            packed_op = base64.b64encode(protocol_packer.pack_operation(generate_edit_sync_pack(obj))).decode("utf-8")
+            mesh_data.append(packed_op)
 
-        triangulate_meshes=False,
+    return mesh_data
 
-        selected_objects_only=False,
-        evaluation_mode='RENDER',
 
-        xform_op_mode='TRS',
-        use_instancing=False,
-    )
+def generate_edit_sync_pack(obj):
+    try:
+        mesh_data = obj.data
+        bm = bmesh.new()
+        bm.from_mesh(mesh_data)
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
 
-    return filepath, filename
-    
+        vertex_coords = [list(v.co) for v in bm.verts]
+        face_indices = [[v.index for v in f.verts] for f in bm.faces]
+
+        bm.free()
+
+        geom_payload = {
+            "v": vertex_coords,
+            "f": face_indices
+        }
+
+        raw_geom_bytes = protocol_packer.pack_operation(geom_payload)
+
+        compressed_geom_bytes = protocol_packer.compress_data(raw_geom_bytes)
+
+        commit_packet = {
+            "type": "BMESH_COMMIT_SYNC",
+            "target": obj.name,
+            "op_id": int(time.time_ns()),
+            "client_id": config.CLIENT_ID,
+            "target_name": obj.name, # Matches the 'target_name' key used on the receiver side
+            "compressed_geom": compressed_geom_bytes # Native binary payload type
+        }
+
+
+        print(f"📦 [COLLAB COMMIT] Encoded & Compressed '{obj.name}' topology.")
+        print(f"   ↳ Raw Verts: {len(vertex_coords)} | Raw Faces: {len(face_indices)}")
+        print(f"   ↳ Compressed Geometry Size: {len(compressed_geom_bytes)} bytes")
+
+        return commit_packet
+
+    except Exception as bmesh_err:
+        print(f"❌ [COLLAB COMMIT ERROR] Failed to package compressed mesh snapshot: {bmesh_err}")
+
 
 def clear_entire_scene():
     """Aggressively purges everything to prevent ID conflicts upon room entry."""
@@ -134,24 +161,60 @@ def clear_entire_scene():
 
 
 
-
-def import_usd_snapshot(filepath):
+def export_glb_snapshot():
     """
-    Loads a downloaded USD snapshot into Blender.
-    Defends against startup/UI race conditions.
+    Exports a binary glTF (.glb) scene snapshot using exact official API properties.
+    Preserves raw quad topology and embeds all external images/textures.
     """
+    timestamp = int(time.time())
+    filename = f"scene_{timestamp}.glb"
+    filepath = os.path.join(bpy.app.tempdir, filename)
 
+    try:
+       
+        bpy.ops.export_scene.gltf(
+            filepath=filepath,
+            export_format='GLB',                
+            
+            # CRITICAL: Prevents auto-triangulation by not applying modifiers destructively
+            export_apply=False,           
+            
+            # Match the exact property keywords from your specific build signature
+            export_vertex_color='MATERIAL',      # Updated key for managing custom mesh color channels
+            export_materials='EXPORT',          # Process and bundle active shader graphs
+            export_extras=True,                  # Retain custom property metadata blocks (like tracking UUIDs)
+            export_cameras=True,                 # Include active camera points
+            export_lights=True,                  # Include scene lighting rigs
+            export_animations=True,              # Correct pluralized attribute key for handling sequence state paths
+            
+            use_selection=False,                 # Track and export the entire outliner scene tree
+            filter_glob='*.glb'                  # Standard fallback execution string
+        )
+        
+        print(f"[COLLAB SCENE] GLB snapshot successfully generated via exact API rules: {filename}")
+        return filepath, filename
+
+    except Exception as e:
+        print(f"[COLLAB SCENE ERROR] GLB export execution failed against API signatures: {e}")
+        return None, None
+
+
+def import_glb_snapshot(filepath):
+    """
+    Loads a downloaded GLB snapshot non-destructively into Blender.
+    Defends against startup/UI race conditions using dynamic window overrides.
+    """
     print("filepath:", filepath)
 
     if not os.path.exists(filepath):
         print(f"[COLLAB SCENE ERROR] Snapshot file not found: {filepath}")
         return False
 
-    # Wait until Blender UI is fully available
+    # Wait until Blender UI is fully available to avoid core API context crashes
     if not bpy.context.window or not bpy.context.screen:
         print("[COLLAB SCENE] UI not ready. Deferring import...")
         bpy.app.timers.register(
-            lambda: import_usd_snapshot(filepath),
+            lambda: import_glb_snapshot(filepath),
             first_interval=0.1
         )
         return True
@@ -159,12 +222,11 @@ def import_usd_snapshot(filepath):
     try:
         win = bpy.context.window
         scr = win.screen
-
         areas = [a for a in scr.areas if a.type == 'VIEW_3D']
 
         if not areas:
             bpy.app.timers.register(
-                lambda: import_usd_snapshot(filepath),
+                lambda: import_glb_snapshot(filepath),
                 first_interval=0.1
             )
             return True
@@ -183,22 +245,27 @@ def import_usd_snapshot(filepath):
             "scene": bpy.context.scene,
         }
 
+        # Safe context override loop execution
         with bpy.context.temp_override(**override_ctx):
-            bpy.ops.wm.usd_import(
-                filepath=filepath
+            bpy.ops.import_scene.gltf(
+                filepath=filepath,
+                import_pack_images=True,  # Unpacks embedded textures automatically into local memory
+                merge_vertices=True
             )
 
-        # Cleanup
+        print("[COLLAB SCENE] GLB snapshot successfully integrated into active viewport.")
+
+        # Cleanup the downloaded temporary cache file
         try:
             os.remove(filepath)
-            print("[COLLAB SCENE] Temporary snapshot removed.")
+            print("[COLLAB SCENE] Temporary snapshot disk storage cleared.")
         except Exception as e:
             print(f"[COLLAB SCENE] Failed to remove temp file: {e}")
 
         return True
 
     except Exception as e:
-        print(f"[COLLAB SCENE ERROR] USD import failed: {e}")
+        print(f"[COLLAB SCENE ERROR] GLB import processing pipeline failed: {e}")
         return False
 # ====================================================================
 # 2. LOCAL SYNC PRIMING PIPELINE (Used by ui_panel.py)
